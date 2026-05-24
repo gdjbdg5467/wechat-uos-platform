@@ -41,10 +41,10 @@ venv/bin/pip install itchat-uos Pillow
 
 ```bash
 cd /tmp
-git clone https://github.com/YOUR_GITHUB_USERNAME/wechat-uos-platform.git
+git clone https://github.com/gdjbdg5467/wechat-uos-platform.git
 ```
 
-把 `YOUR_GITHUB_USERNAME` 替换成你的 GitHub 用户名。
+把 `gdjbdg5467` 替换成你的 GitHub 用户名。
 
 ### 3. 复制插件到 Hermes
 
