@@ -15,7 +15,7 @@ class FakeItChat:
             "NickName": "测试群",
             "MemberList": [
                 {"UserName": "@owner", "NickName": "群主"},
-                {"UserName": "@alice", "NickName": "Alice", "DisplayName": "爱丽丝"},
+                {"UserName": "@alice", "NickName": "Bob", "DisplayName": "爱丽丝"},
                 {"UserName": "@bob", "NickName": "Bob"},
             ],
         }
@@ -55,7 +55,9 @@ def test_authorize_group_consumes_command_and_sets_initial_admin(monkeypatch, tm
     assert group["authorized"] is True
     assert group["initial_admin_uid"] == "@zhangsan"
     assert "@zhangsan" in group["admins"]
-    assert adapter._itchat.sent[-1] == ("@@group", "本群已授权成功。\n管理员：张三\nUID：@zhangsan")
+    assert adapter._itchat.sent[-1] == ("@@group", "本群已授权成功。\n管理员：张三")
+    assert "UID" not in adapter._itchat.sent[-1][1]
+    assert "@zhangsan" not in adapter._itchat.sent[-1][1]
 
 
 def test_allowed_member_can_use_group_after_admin_grants_permission(monkeypatch, tmp_path):
@@ -68,6 +70,24 @@ def test_allowed_member_can_use_group_after_admin_grants_permission(monkeypatch,
     group = adapter._acl["groups"]["@@group"]
     assert "@alice" in group["allowed_users"]
     assert adapter._can_use_group("@@group", "测试群", "爱丽丝", "@alice") is True
+    assert adapter._itchat.sent[-1] == ("@@group", "已授权：爱丽丝")
+    assert "UID" not in adapter._itchat.sent[-1][1]
+    assert "@alice" not in adapter._itchat.sent[-1][1]
+
+
+def test_acl_list_hides_member_uids(monkeypatch, tmp_path):
+    adapter = make_adapter(monkeypatch, tmp_path)
+    adapter._handle_acl_command("授权此群聊", sender="张三", sender_id="@zhangsan", chat_id="@@group", group_name="测试群")
+    adapter._handle_acl_command("授权 爱丽丝", sender="张三", sender_id="@zhangsan", chat_id="@@group", group_name="测试群")
+
+    consumed = adapter._handle_acl_command("名单", sender="张三", sender_id="@zhangsan", chat_id="@@group", group_name="测试群")
+
+    assert consumed is True
+    text = adapter._itchat.sent[-1][1]
+    assert "爱丽丝" in text
+    assert "张三" in text
+    assert "@alice" not in text
+    assert "@zhangsan" not in text
 
 
 def test_non_admin_cannot_manage_acl(monkeypatch, tmp_path):
@@ -102,7 +122,7 @@ def test_chinese_acl_command_accepts_target_without_space(monkeypatch, tmp_path)
     assert "@alice" in adapter._acl["groups"]["@@group"]["allowed_users"]
 
 
-def test_group_event_is_trusted_after_adapter_acl_accepts_sender(monkeypatch, tmp_path):
+def test_group_event_marks_acl_role_for_admin_and_user(monkeypatch, tmp_path):
     adapter = make_adapter(monkeypatch, tmp_path)
     adapter._loop = asyncio.new_event_loop()
     adapter._handle_acl_command("授权此群聊", sender="张三", sender_id="@zhangsan", chat_id="@@group", group_name="测试群")
@@ -121,10 +141,22 @@ def test_group_event_is_trusted_after_adapter_acl_accepts_sender(monkeypatch, tm
         user_name="爱丽丝",
         raw={},
     )
+    adapter._submit_event(
+        text="重启网关",
+        chat_id="@@group",
+        chat_name="测试群",
+        chat_type="group",
+        user_id="@zhangsan",
+        user_name="张三",
+        raw={},
+    )
 
     adapter._loop.close()
-    assert captured
+    assert len(captured) == 2
     assert getattr(captured[0].source, "trusted_by_adapter", False) is True
+    assert getattr(captured[0].source, "wechat_uos_acl_role", "") == "user"
+    assert getattr(captured[1].source, "trusted_by_adapter", False) is True
+    assert getattr(captured[1].source, "wechat_uos_acl_role", "") == "admin"
 
 
 def test_gateway_authorizes_adapter_trusted_source_even_with_global_allowlist(monkeypatch):
@@ -135,7 +167,7 @@ def test_gateway_authorizes_adapter_trusted_source_even_with_global_allowlist(mo
     monkeypatch.setenv("GATEWAY_ALLOWED_USERS", "someone_else")
 
     source = SessionSource(
-        platform=Platform.WEIXIN,
+        platform=Platform("wechat_uos"),
         chat_id="@@group",
         chat_type="group",
         user_id="@alice",
@@ -144,3 +176,26 @@ def test_gateway_authorizes_adapter_trusted_source_even_with_global_allowlist(mo
     setattr(source, "trusted_by_adapter", True)
 
     assert runner._is_user_authorized(source) is True
+
+
+def test_gateway_restricts_wechat_uos普通用户_slash_commands():
+    from gateway.run import GatewayRunner
+
+    runner = object.__new__(GatewayRunner)
+    runner.config = {}
+    source = SessionSource(
+        platform=Platform("wechat_uos"),
+        chat_id="@@group",
+        chat_type="group",
+        user_id="@alice",
+        user_name="爱丽丝",
+    )
+    setattr(source, "wechat_uos_acl_role", "user")
+
+    assert runner._check_slash_access(source, "status") is None
+    denied = runner._check_slash_access(source, "restart")
+    assert denied is not None
+    assert "普通授权用户" in denied
+
+    setattr(source, "wechat_uos_acl_role", "admin")
+    assert runner._check_slash_access(source, "restart") is None

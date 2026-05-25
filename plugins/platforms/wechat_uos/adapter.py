@@ -463,6 +463,22 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._save_acl()
             return allowed
 
+    def _group_member_role(self, group_id: str, group_name: str, sender: str, sender_id: str) -> str:
+        """Return accepted ACL tier for a group sender.
+
+        ``admin`` keeps full gateway/tool access. ``user`` is restricted by the
+        gateway to chat/search/query toolsets and read-only slash commands.
+        """
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            if self._is_group_admin(group, sender, sender_id):
+                return "admin"
+            if sender_id in group.get("allowed_users", []):
+                return "user"
+            if self.allowed_users and (sender in self.allowed_users or sender_id in self.allowed_users):
+                return "user"
+        return "user"
+
     def _is_group_admin(self, group: Dict[str, Any], sender: str, sender_id: str) -> bool:
         # Existing global admin env remains a bootstrap/admin escape hatch.
         if sender in self.admin_users or sender_id in self.admin_users:
@@ -474,8 +490,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             group = self._group_acl(group_id, group_name)
             admins = group.get("admins", [])
             allowed = group.get("allowed_users", [])
-            admin_lines = [f"- {self._member_display(group, uid)} / {uid}" for uid in admins] or ["- 无"]
-            allowed_lines = [f"- {self._member_display(group, uid)} / {uid}" for uid in allowed] or ["- 无"]
+            admin_lines = [f"- {self._member_display(group, uid)}" for uid in admins] or ["- 无"]
+            allowed_lines = [f"- {self._member_display(group, uid)}" for uid in allowed] or ["- 无"]
             status = "已授权" if group.get("authorized") else "未授权"
             return "\n".join([
                 f"当前群：{group.get('name') or group_name or group_id}",
@@ -514,7 +530,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                         self._refresh_group_members(chat_id, group_name)
                     except Exception:
                         logger.debug("WeChatUOS ACL: member refresh after authorization failed", exc_info=True)
-                    self._itchat.send(f"本群已授权成功。\n管理员：{sender}\nUID：{sender_id}", toUserName=chat_id)
+                    self._itchat.send(f"本群已授权成功。\n管理员：{sender}", toUserName=chat_id)
                     return True
                 if self._is_group_admin(group, sender, sender_id):
                     self._itchat.send("本群已授权，无需重复授权。", toUserName=chat_id)
@@ -592,7 +608,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 action = "已取消管理员"
             group["updated_at"] = int(time.time())
             self._save_acl()
-        self._itchat.send(f"{action}：{label}\nUID：{target_uid}", toUserName=chat_id)
+        self._itchat.send(f"{action}：{label}", toUserName=chat_id)
         logger.info("WeChatUOS ACL: %s %s uid=%s by admin %s/%s in group %s", action, label, target_uid, sender, sender_id, group_name)
         return True
 
@@ -613,6 +629,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             # the gateway's global allowlist does not block the same sender a
             # second time.
             setattr(source, "trusted_by_adapter", True)
+            setattr(source, "wechat_uos_acl_role", self._group_member_role(chat_id, chat_name, user_name, user_id))
         event = MessageEvent(
             text=text,
             message_type=MessageType.TEXT,

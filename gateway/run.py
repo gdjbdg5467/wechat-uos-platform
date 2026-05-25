@@ -9155,6 +9155,22 @@ class GatewayRunner:
         return "\n".join(lines)
 
 
+    def _is_wechat_uos_restricted_user(self, source: SessionSource) -> bool:
+        """True for WeChat UOS group members authorized as normal users.
+
+        The adapter marks accepted group messages with ``wechat_uos_acl_role``.
+        Admins keep full access; ordinary users are intentionally limited to
+        chat/search/query and must not reach local-service tools or gateway
+        control commands.
+        """
+        platform = getattr(source, "platform", None)
+        platform_value = getattr(platform, "value", None) or str(platform or "")
+        return (
+            platform_value == "wechat_uos"
+            and getattr(source, "chat_type", "") == "group"
+            and getattr(source, "wechat_uos_acl_role", "") == "user"
+        )
+
     def _check_slash_access(
         self, source: SessionSource, canonical_cmd: str
     ) -> Optional[str]:
@@ -9172,6 +9188,16 @@ class GatewayRunner:
 
         if not canonical_cmd:
             return None
+        if self._is_wechat_uos_restricted_user(source):
+            allowed = {"help", "commands", "whoami", "status", "agents"}
+            if canonical_cmd in allowed:
+                return None
+            logger.info(
+                "WeChatUOS ACL: slash command /%s denied for ordinary user %s",
+                canonical_cmd,
+                source.user_id,
+            )
+            return "⛔ 你是普通授权用户，只能搜索、查询和聊天；本机服务和管理指令仅管理员可用。"
         policy = _policy_for_source(self.config, source)
         if not policy.enabled or policy.can_run(source.user_id, canonical_cmd):
             return None
@@ -15451,6 +15477,20 @@ class GatewayRunner:
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
+        if self._is_wechat_uos_restricted_user(source):
+            allowed_for_wechat_user = {
+                "web",
+                "browser",
+                "vision",
+                "session_search",
+                "clarify",
+            }
+            enabled_toolsets = [ts for ts in enabled_toolsets if ts in allowed_for_wechat_user]
+            logger.info(
+                "WeChatUOS ACL: restricted non-admin user %s to toolsets=%s",
+                source.user_id,
+                enabled_toolsets,
+            )
         agent_cfg_local = user_config.get("agent") or {}
         disabled_toolsets = agent_cfg_local.get("disabled_toolsets") or None
 
