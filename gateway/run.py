@@ -6107,6 +6107,12 @@ class GatewayRunner:
         if source.platform in {Platform.HOMEASSISTANT, Platform.WEBHOOK}:
             return True
 
+        # Some plugin adapters perform their own authenticated pre-filtering
+        # before yielding an event to the gateway. Honor that explicit marker
+        # so an adapter-local ACL is not blocked again by global allowlists.
+        if getattr(source, "trusted_by_adapter", False):
+            return True
+
         user_id = source.user_id
 
         # Telegram (and similar) authorize entire group/forum/channel chats

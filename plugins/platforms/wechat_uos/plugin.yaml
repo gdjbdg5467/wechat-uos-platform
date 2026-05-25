@@ -1,0 +1,39 @@
+name: wechat-uos-platform
+label: WeChat UOS
+kind: platform
+version: 0.1.0
+description: >
+  Personal WeChat gateway adapter for Hermes Agent using itchat-uos
+  (reverse-engineered UOS Web WeChat protocol). Supports QR login with a real
+  personal WeChat account and group @mentions.
+author: Hermes Agent
+requires_env:
+  - name: WECHAT_UOS_ENABLED
+    description: "Set true to enable the WeChat UOS personal-account adapter"
+    prompt: "Enable WeChat UOS? (true/false)"
+    password: false
+optional_env:
+  - name: WECHAT_UOS_ALLOWED_GROUPS
+    description: "Comma-separated WeChat group IDs/names allowed; empty means all groups"
+    prompt: "Allowed groups (optional)"
+    password: false
+  - name: WECHAT_UOS_ALLOWED_USERS
+    description: "Comma-separated sender nicknames/UserNames allowed; empty means all users"
+    prompt: "Allowed users (optional)"
+    password: false
+  - name: WECHAT_UOS_RESPOND_TO_DMS
+    description: "Also respond to private messages (default false)"
+    prompt: "Respond to DMs? (true/false)"
+    password: false
+  - name: WECHAT_UOS_QR_HTTP
+    description: "Serve QR code over HTTP for easier scan (default true)"
+    prompt: "Serve QR over HTTP? (true/false)"
+    password: false
+  - name: WECHAT_UOS_QR_PORT
+    description: "QR HTTP server port (default 8646)"
+    prompt: "QR HTTP port"
+    password: false
+  - name: WECHAT_UOS_HOME_CHANNEL
+    description: "Default chat/group ID for cron/notification delivery"
+    prompt: "Home channel (optional)"
+    password: false
