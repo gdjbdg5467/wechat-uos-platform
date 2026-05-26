@@ -122,6 +122,21 @@ def test_chinese_acl_command_accepts_target_without_space(monkeypatch, tmp_path)
     assert "@alice" in adapter._acl["groups"]["@@group"]["allowed_users"]
 
 
+def test_acl_restores_authorized_group_when_runtime_group_id_changes(monkeypatch, tmp_path):
+    adapter = make_adapter(monkeypatch, tmp_path)
+    adapter._handle_acl_command("授权此群聊", sender="张三", sender_id="@zhangsan", chat_id="@@old", group_name="测试群")
+    adapter._handle_acl_command("授权 爱丽丝", sender="张三", sender_id="@zhangsan", chat_id="@@old", group_name="测试群")
+
+    restarted = make_adapter(monkeypatch, tmp_path)
+
+    assert restarted._can_use_group("@@new", "测试群", "爱丽丝", "@alice") is True
+    restored = restarted._acl["groups"]["@@new"]
+    assert restored["authorized"] is True
+    assert restored["restored_from_group_id"] == "@@old"
+    assert "@zhangsan" in restored["admins"]
+    assert "@alice" in restored["allowed_users"]
+
+
 def test_group_event_marks_acl_role_for_admin_and_user(monkeypatch, tmp_path):
     adapter = make_adapter(monkeypatch, tmp_path)
     adapter._loop = asyncio.new_event_loop()

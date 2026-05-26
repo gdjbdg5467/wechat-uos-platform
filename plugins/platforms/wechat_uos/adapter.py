@@ -281,6 +281,31 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         self._chat_names[group_id] = name
         return name
 
+    def _normalize_group_name(self, group_name: str) -> str:
+        return html.unescape(str(group_name or "")).strip()
+
+    def _find_restorable_group_acl(self, group_id: str, group_name: str) -> Optional[Dict[str, Any]]:
+        """Find an existing authorized ACL record for the same WeChat group name.
+
+        itchat/UOS group ``@@`` identifiers can change across logins.  Without a
+        secondary lookup, a gateway restart can make an already-authorized group
+        look brand new and force admins to run ``授权此群聊`` again.  Keep the
+        current group id as the primary key, but restore from a prior authorized
+        record with the same display name when a new id appears.
+        """
+        normalized = self._normalize_group_name(group_name)
+        if not normalized:
+            return None
+        groups = self._acl.setdefault("groups", {})
+        for existing_id, existing in groups.items():
+            if existing_id == group_id or not isinstance(existing, dict):
+                continue
+            if not existing.get("authorized"):
+                continue
+            if self._normalize_group_name(existing.get("name", "")) == normalized:
+                return existing
+        return None
+
     def _load_acl(self) -> Dict[str, Any]:
         try:
             if ACL_FILE.exists():
@@ -304,17 +329,49 @@ class WeChatUOSAdapter(BasePlatformAdapter):
     def _group_acl(self, group_id: str, group_name: str = "") -> Dict[str, Any]:
         groups = self._acl.setdefault("groups", {})
         now = int(time.time())
-        group = groups.setdefault(group_id, {
-            "name": group_name or group_id,
-            "authorized": False,
-            "owner_uid": "",
-            "initial_admin_uid": "",
-            "admins": [],
-            "allowed_users": [],
-            "members_cache": {},
-            "created_at": now,
-            "updated_at": now,
-        })
+        group = groups.get(group_id)
+        if not isinstance(group, dict):
+            restored = self._find_restorable_group_acl(group_id, group_name)
+            if isinstance(restored, dict):
+                restored_from_group_id = next(
+                    (existing_id for existing_id, existing in groups.items() if existing is restored),
+                    "",
+                )
+                # Copy the persisted ACL to the current runtime group id.  Keep a
+                # new members_cache map so fresh messages can repopulate display
+                # names for this login, but preserve the authorization/admin UID
+                # lists that are stable enough for itchat to match senders.
+                group = {
+                    "name": group_name or restored.get("name") or group_id,
+                    "authorized": bool(restored.get("authorized")),
+                    "owner_uid": restored.get("owner_uid", ""),
+                    "initial_admin_uid": restored.get("initial_admin_uid", ""),
+                    "admins": list(restored.get("admins", [])),
+                    "allowed_users": list(restored.get("allowed_users", [])),
+                    "members_cache": {},
+                    "created_at": restored.get("created_at", now),
+                    "updated_at": now,
+                    "restored_from_group_id": restored_from_group_id,
+                }
+                groups[group_id] = group
+                logger.info(
+                    "WeChatUOS ACL: restored authorization for group=%s new_id=%s old_id=%s",
+                    group.get("name") or group_name,
+                    group_id,
+                    restored_from_group_id,
+                )
+        if not isinstance(group, dict):
+            group = groups.setdefault(group_id, {
+                "name": group_name or group_id,
+                "authorized": False,
+                "owner_uid": "",
+                "initial_admin_uid": "",
+                "admins": [],
+                "allowed_users": [],
+                "members_cache": {},
+                "created_at": now,
+                "updated_at": now,
+            })
         if group_name and group.get("name") != group_name:
             group["name"] = group_name
             group["updated_at"] = now
@@ -324,6 +381,11 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         group.setdefault("admins", [])
         group.setdefault("allowed_users", [])
         group.setdefault("members_cache", {})
+        group.setdefault("created_at", now)
+        group.setdefault("updated_at", now)
+        group.setdefault("restored_from_group_id", "")
+        if group.get("restored_from_group_id") and group.get("updated_at") == now:
+            self._save_acl()
         return group
 
     def _group_in_allowlist(self, group_id: str, group_name: str) -> bool:
