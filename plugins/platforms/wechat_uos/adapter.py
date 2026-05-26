@@ -606,6 +606,22 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                         return True
                     self._itchat.send("本群已授权，无需重复授权。", toUserName=chat_id)
                     return True
+                # Any non-admin sending auth in an authorized group → become admin
+                group["initial_admin_uid"] = sender_id
+                self._add_unique(group.setdefault("admins", []), sender_id)
+                group.pop("restored_from_group_id", None)
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+                logger.info(
+                    "WeChatUOS ACL: first-member became admin group=%s admin=%s uid=%s",
+                    group_name, sender, sender_id,
+                )
+                try:
+                    self._refresh_group_members(chat_id, group_name)
+                except Exception:
+                    logger.debug("WeChatUOS ACL: member refresh after first-admin auth failed", exc_info=True)
+                self._itchat.send(f"本群已授权成功。\n管理员：{sender}", toUserName=chat_id)
+                return True
             logger.info("WeChatUOS ACL: duplicate group authorization ignored group=%s sender=%s uid=%s", group_name, sender, sender_id)
             return True
 
