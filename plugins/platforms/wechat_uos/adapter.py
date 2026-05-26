@@ -595,6 +595,15 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     self._itchat.send(f"本群已授权成功。\n管理员：{sender}", toUserName=chat_id)
                     return True
                 if self._is_group_admin(group, sender, sender_id):
+                    if group.get("restored_from_group_id"):
+                        logger.info(
+                            "WeChatUOS ACL: remembered group authorization silently accepted group=%s sender=%s uid=%s restored_from=%s",
+                            group_name,
+                            sender,
+                            sender_id,
+                            group.get("restored_from_group_id"),
+                        )
+                        return True
                     self._itchat.send("本群已授权，无需重复授权。", toUserName=chat_id)
                     return True
             logger.info("WeChatUOS ACL: duplicate group authorization ignored group=%s sender=%s uid=%s", group_name, sender, sender_id)
