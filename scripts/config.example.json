@@ -1,0 +1,9 @@
+{
+  "bot_token": "YOUR_BOT_TOKEN",
+  "forward_rules": [
+    {
+      "tg_channel": "@your_channel",
+      "wechat_groups": ["@@your_wechat_group_id"]
+    }
+  ]
+}
