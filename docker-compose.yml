@@ -1,0 +1,19 @@
+version: "3.8"
+
+services:
+  wxpowerbot:
+    build: .
+    container_name: wxpowerbot
+    restart: unless-stopped
+    volumes:
+      - ./data:/data
+    ports:
+      - "8646:8646"   # QR 码 HTTP 服务
+    environment:
+      - WXPOWERBOT_DATA_DIR=/data
+      - TZ=Asia/Shanghai
+    # 配置也可以通过环境变量覆盖
+    # - WXPOWERBOT_ADMIN_USERS=昵称1,昵称2
+    # - WXPOWERBOT_PANSOU_API=http://192.168.1.100:850/api/search
+    # - WXPOWERBOT_CFTC_USERNAME=xxx
+    # - WXPOWERBOT_CFTC_PASSWORD=xxx

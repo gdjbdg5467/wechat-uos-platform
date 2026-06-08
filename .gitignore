@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pkl
+.env
+data/
+.DS_Store
+itchat*.png
