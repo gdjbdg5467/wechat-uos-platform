@@ -16,17 +16,20 @@ import logging
 import os
 import threading
 import time
+import urllib.request
 from datetime import datetime
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import urlparse
+from urllib.parse import urlparse, quote as _urlquote, urlencode as _urlencode
+from urllib.request import urlopen as _urlopen, Request as _URLRequest
 
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
 logger = logging.getLogger(__name__)
 
+SUPER_ADMIN_NAMES = {"夢魚", "庾梦"}  # only these nicknames can be admin across all groups
 HERMES_HOME = Path(os.getenv("HERMES_HOME") or "/root/.hermes")
 STATE_DIR = HERMES_HOME / "wechat_uos"
 QR_PNG = STATE_DIR / "itchat_qr.png"
@@ -35,6 +38,35 @@ PKL_FILE = STATE_DIR / "itchat.pkl"
 ACL_FILE = STATE_DIR / "acl.json"
 DEFAULT_QR_PORT = 8646
 MAX_MESSAGE_LENGTH = 3500
+
+# ── PanSou 盘搜 ────────────────────────────────────────────────────────────
+PANSW_API = "http://192.168.10.216:850/api/search"
+PANSOU_ALLOWED_TYPES = {"quark", "115", "baidu", "uc", "magnet"}
+# ── CFTC 图床上传 ────────────────────────────────────────────────────────────
+CFTC_DIR = HERMES_HOME / "data" / "cftc"
+CFTC_CONFIG_FILE = CFTC_DIR / "config.json"
+CFTC_STATE_FILE = CFTC_DIR / "group_state.json"
+CFTC_COOKIE_FILE = CFTC_DIR / "cftc_cookie.json"
+CFTC_MEDIA_DIR = CFTC_DIR / "media"
+# ── LSPosed 模块更新 ─────────────────────────────────────────────────────────
+LSPOSED_DIR = HERMES_HOME / "data" / "lsposed_tracker"
+LSPOSED_CONFIG = LSPOSED_DIR / "config.json"
+LSPOSED_STATE_FILE = LSPOSED_DIR / "state.json"
+# ── WeRSS 公众号文章推送 ──
+WERSS_BASE = "http://localhost:8001/api/v1/wx"
+WERSS_USER = "admin"
+WERSS_PASS = "admin123"
+WERSS_STATE_FILE = STATE_DIR / "werss_state.json"
+WERSS_POLL_INTERVAL = 300  # 5 minutes
+
+PANSOU_SOURCE_LABELS = {
+    "quark": "夸克网盘",
+    "115": "115网盘",
+    "baidu": "百度网盘",
+    "uc": "UC网盘",
+    "magnet": "磁力链接",
+}
+PANSOU_MESSAGE_HEADER = "🔍 搜索「{keyword}」"
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -122,8 +154,20 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._login_name = ""
         self._chat_names: Dict[str, str] = {}
+        # ── CFTC upload state ──
+        self._cftc_recent_media: Dict[str, list] = {}
+        self._cftc_processed_ids: set = set()
+        # ── LSPosed tracker state ──
+        self._lsposed_stop = threading.Event()
+        self._lsposed_thread: Optional[threading.Thread] = None
+        # ── WeRSS poller state ──
+        self._werss_stop = threading.Event()
+        self._werss_thread: Optional[threading.Thread] = None
+        self._startup_ts = time.time()
+        self._login_ts = 0
         self._acl_lock = threading.RLock()
         self._acl: Dict[str, Any] = self._load_acl()
+        self._super_admin_uid: str = self._acl.get("_super_admin_uid", "")
 
     @property
     def name(self) -> str:
@@ -160,6 +204,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             except Exception:
                 pass
             self._qr_server = None
+        self._werss_stop.set()
 
     async def send(self, chat_id: str, content: str, reply_to: Optional[str] = None, metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if self._itchat is None:
@@ -200,14 +245,15 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             QR_URL_TXT.write_text(f"https://login.weixin.qq.com/l/{str(uuid).strip()}\n", encoding="utf-8")
 
     def _login_callback(self) -> None:
+        self._login_ts = time.time()
         try:
             user = self._itchat.search_friends() if self._itchat else {}
             if not isinstance(user, dict):
                 user = {}
             self._login_name = html.unescape(str(user.get("NickName") or ""))
-            logger.info("WeChatUOS: login successful as %s (%s)", self._login_name, user.get("UserName"))
+            logger.info("WeChatUOS: login successful as %s at %.0f", self._login_name, self._login_ts)
         except Exception:
-            logger.info("WeChatUOS: login successful")
+            logger.info("WeChatUOS: login successful at %.0f", self._login_ts)
 
     def _run_itchat(self) -> None:
         try:
@@ -222,12 +268,40 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 group_id = getattr(msg, "fromUserName", None) or msg.get("FromUserName")
                 sender_id = getattr(msg, "actualUserName", None) or msg.get("ActualUserName") or ""
                 sender = getattr(msg, "actualNickName", None) or msg.get("ActualNickName") or sender_id
+                # ── 静默启动：过滤登录前重放的旧消息 ──
+                if self._login_ts > 0:
+                    msg_time = getattr(msg, "createTime", None) or msg.get("CreateTime", 0)
+                    if isinstance(msg_time, (int, float)) and msg_time < self._login_ts - 2:
+                        return
                 raw_text = getattr(msg, "text", None) or msg.get("Text") or msg.get("Content") or ""
                 text = _strip_at_prefix(raw_text)
                 group_name = self._resolve_group_name(group_id)
                 if not self._group_in_allowlist(group_id, group_name):
                     return
                 if self._handle_acl_command(text, sender=sender, sender_id=sender_id, chat_id=group_id, group_name=group_name):
+                    return
+                # ── PanSou 盘搜 ──
+                pansou_result = self._handle_pansou_search(text, group_id, group_name, sender=sender, sender_id=sender_id)
+                if pansou_result is not None:
+                    return
+                # ── PanSou toggle ──
+                if self._handle_pansou_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                # ── TG forward toggle ──
+                tg_fwd_compact = text.strip().lower().replace(" ", "")
+                if self._handle_tg_fwd_toggle_command(tg_fwd_compact, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                # ── CFTC toggle/upload commands ──
+                cftc_compact = text.strip().lower().replace(" ", "")
+                if self._handle_cftc_toggle_command(cftc_compact, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                if self._handle_cftc_upload_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                # ── LSPosed tracker commands ──
+                if self._handle_lsposed_text_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                # ── WeRSS toggle commands ──
+                if self._handle_werss_text_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
                 if not self._can_use_group(group_id, group_name, sender, sender_id):
                     return
@@ -260,6 +334,13 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 exitCallback=lambda: logger.warning("WeChatUOS: logged out/disconnected"),
             )
             logger.info("WeChatUOS: listening for group @mentions")
+            self._start_tg_fwd()
+            # ── Start LSPosed module tracker polling ──
+            self._start_lsposed_tracker()
+            # ── Start WeRSS article poller ──
+            self._start_werss_poller()
+            # ── Register media handlers for CFTC upload ──
+            self._register_cftc_media_handlers()
             itchat.run(blockThread=True)
         except Exception:
             logger.exception("WeChatUOS: listener crashed")
@@ -360,6 +441,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     group_id,
                     restored_from_group_id,
                 )
+                # Also migrate GID in tg_fwd config and CFTC group state
+                self._migrate_external_gid(restored_from_group_id, group_id, group.get("name") or group_name)
         if not isinstance(group, dict):
             group = groups.setdefault(group_id, {
                 "name": group_name or group_id,
@@ -384,6 +467,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         group.setdefault("created_at", now)
         group.setdefault("updated_at", now)
         group.setdefault("restored_from_group_id", "")
+        group.setdefault("lsposed_enabled", False)
+        group.setdefault("werss_enabled", True)
         if group.get("restored_from_group_id") and group.get("updated_at") == now:
             self._save_acl()
         return group
@@ -418,6 +503,21 @@ class WeChatUOSAdapter(BasePlatformAdapter):
     def _add_unique(self, seq: List[str], value: str) -> None:
         if value and value not in seq:
             seq.append(value)
+
+    def _is_super_admin(self, sender: str, sender_id: str) -> bool:
+        """Check if sender is 夢魚/庾梦 — the only super admin across all groups."""
+        # Known UID match (cached after first identify)
+        if self._super_admin_uid and sender_id == self._super_admin_uid:
+            return True
+        # Name-based match for first-time identification
+        if sender in SUPER_ADMIN_NAMES:
+            if sender_id and sender_id != self._super_admin_uid:
+                self._super_admin_uid = sender_id
+                self._acl["_super_admin_uid"] = sender_id
+                self._save_acl()
+                logger.info("WeChatUOS ACL: super admin UID cached %s (%s)", sender_id[:16], sender)
+            return True
+        return False
 
     def _refresh_group_members(self, group_id: str, group_name: str = "") -> int:
         """Refresh group member cache. Best-effort: itchat APIs differ by version."""
@@ -466,7 +566,9 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 owner_uid = str(owner.get("UserName") or "")
                 if owner_uid:
                     group["owner_uid"] = owner_uid
-                    self._add_unique(group.setdefault("admins", []), owner_uid)
+                    # Only record owner uid for reference; do NOT auto-add as admin.
+                    if self._is_super_admin(self._member_display(group, owner_uid), owner_uid):
+                        self._add_unique(group.setdefault("admins", []), owner_uid)
                     logger.info("WeChatUOS ACL: owner detected group=%s owner=%s uid=%s", group.get("name") or group_id, self._member_display(group, owner_uid), owner_uid)
             group["updated_at"] = int(time.time())
             self._save_acl()
@@ -506,7 +608,12 @@ class WeChatUOSAdapter(BasePlatformAdapter):
     def _is_group_authorize_command(self, text: str) -> bool:
         s = (text or "").strip().lower()
         compact = s.replace(" ", "")
-        return compact in {"授权此群聊", "授权本群", "启用本群", "开启本群", "authorizegroup", "/authorizegroup"}
+        return compact in {"授权此群聊", "授权本群", "启用本群", "开启本群", "开启授权", "authorizegroup", "/authorizegroup"}
+
+    def _is_group_deauthorize_command(self, text: str) -> bool:
+        s = (text or "").strip().lower()
+        compact = s.replace(" ", "")
+        return compact in {"关闭授权", "关闭本群", "禁用本群", "deauthorizegroup", "/deauthorizegroup"}
 
     def _can_use_group(self, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         with self._acl_lock:
@@ -516,10 +623,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 logger.info("WeChatUOS ACL: ignored unauthorized group=%s sender=%s uid=%s", group_name, sender, sender_id)
                 self._save_acl()
                 return False
-            allowed = sender_id in group.get("admins", []) or sender_id in group.get("allowed_users", [])
-            # Backward-compatible escape hatch for existing global env allowlist.
-            if not allowed and self.allowed_users and (sender in self.allowed_users or sender_id in self.allowed_users):
-                allowed = True
+            # Super admin (夢魚) and group-level admins can use the bot.
+            allowed = self._is_group_admin(group, sender, sender_id)
             if not allowed:
                 logger.info("WeChatUOS ACL: ignored unauthorized sender %s uid=%s in group %s", sender, sender_id, group_name)
             self._save_acl()
@@ -542,8 +647,9 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         return "user"
 
     def _is_group_admin(self, group: Dict[str, Any], sender: str, sender_id: str) -> bool:
-        # Existing global admin env remains a bootstrap/admin escape hatch.
-        if sender in self.admin_users or sender_id in self.admin_users:
+        # Super admin (夢魚/庾梦) is admin everywhere.
+        # Group-level admins are explicitly authorized by 夢魚 via "授权昵称".
+        if self._is_super_admin(sender, sender_id):
             return True
         return sender_id in group.get("admins", [])
 
@@ -582,17 +688,25 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             with self._acl_lock:
                 group = self._group_acl(chat_id, group_name)
                 if not group.get("authorized"):
+                    # Only super admin (夢魚/庾梦) can authorize a new group
+                    if not self._is_super_admin(sender, sender_id):
+                        self._itchat.send("你没有权限开启本群授权，请联系管理员。", toUserName=chat_id)
+                        return True
                     group["authorized"] = True
                     group["initial_admin_uid"] = sender_id
-                    self._add_unique(group.setdefault("admins", []), sender_id)
                     group["updated_at"] = int(time.time())
                     self._save_acl()
-                    logger.info("WeChatUOS ACL: group initialized group=%s admin=%s uid=%s", group_name, sender, sender_id)
+                    logger.info("WeChatUOS ACL: group authorized group=%s super_admin=%s uid=%s", group_name, sender, sender_id)
                     try:
                         self._refresh_group_members(chat_id, group_name)
                     except Exception:
                         logger.debug("WeChatUOS ACL: member refresh after authorization failed", exc_info=True)
-                    self._itchat.send(f"本群已授权成功。\n管理员：{sender}", toUserName=chat_id)
+                    self._itchat.send("本群已授权成功。", toUserName=chat_id)
+                    # 自动加入 TG 转发列表
+                    try:
+                        self._auto_add_tg_fwd_group(chat_id, group_name)
+                    except Exception:
+                        logger.debug("WeChatUOS ACL: auto TG fwd add after auth failed", exc_info=True)
                     return True
                 if self._is_group_admin(group, sender, sender_id):
                     if group.get("restored_from_group_id"):
@@ -606,23 +720,26 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                         return True
                     self._itchat.send("本群已授权，无需重复授权。", toUserName=chat_id)
                     return True
-                # Any non-admin sending auth in an authorized group → become admin
-                group["initial_admin_uid"] = sender_id
-                self._add_unique(group.setdefault("admins", []), sender_id)
-                group.pop("restored_from_group_id", None)
-                group["updated_at"] = int(time.time())
-                self._save_acl()
-                logger.info(
-                    "WeChatUOS ACL: first-member became admin group=%s admin=%s uid=%s",
-                    group_name, sender, sender_id,
-                )
-                try:
-                    self._refresh_group_members(chat_id, group_name)
-                except Exception:
-                    logger.debug("WeChatUOS ACL: member refresh after first-admin auth failed", exc_info=True)
-                self._itchat.send(f"本群已授权成功。\n管理员：{sender}", toUserName=chat_id)
+                # Non-super-admin sending auth in an authorized group → denied
+                self._itchat.send("你没有权限管理本群授权。", toUserName=chat_id)
                 return True
             logger.info("WeChatUOS ACL: duplicate group authorization ignored group=%s sender=%s uid=%s", group_name, sender, sender_id)
+            return True
+
+        if self._is_group_deauthorize_command(text):
+            with self._acl_lock:
+                group = self._group_acl(chat_id, group_name)
+                if not group.get("authorized"):
+                    self._itchat.send("本群尚未授权，无需关闭。", toUserName=chat_id)
+                    return True
+                if not self._is_group_admin(group, sender, sender_id):
+                    self._itchat.send("你没有权限关闭本群的授权。", toUserName=chat_id)
+                    return True
+                group["authorized"] = False
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+            logger.info("WeChatUOS ACL: group deauthorized group=%s admin=%s uid=%s", group_name, sender, sender_id)
+            self._itchat.send("本群已关闭授权，机器人将不再响应群消息。\n如需重新开启，请发送：@机器人 开启授权", toUserName=chat_id)
             return True
 
         aliases = {
@@ -652,7 +769,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             authorized = bool(group.get("authorized"))
             is_admin = self._is_group_admin(group, sender, sender_id)
         if not authorized:
-            self._itchat.send("当前群尚未授权。请发送：@机器人 授权此群聊", toUserName=chat_id)
+            self._itchat.send("当前群尚未授权。请发送：@机器人 开启授权 或 授权此群聊", toUserName=chat_id)
             return True
         if not is_admin:
             self._itchat.send("你没有权限管理本群机器人。", toUserName=chat_id)
@@ -685,9 +802,16 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 group.setdefault("allowed_users", [])[:] = [uid for uid in group.get("allowed_users", []) if uid != target_uid]
                 action = "已取消授权"
             elif cmd in {"/admin", "admin", "设管理员", "添加管理员", "管理员"}:
+                # Only super admin (夢魚) can add/remove group-level admins
+                if not self._is_super_admin(sender, sender_id):
+                    self._itchat.send("你没有权限设置管理员。请联系超级管理员。", toUserName=chat_id)
+                    return True
                 self._add_unique(group.setdefault("admins", []), target_uid)
                 action = "已设为管理员"
             else:
+                if not self._is_super_admin(sender, sender_id):
+                    self._itchat.send("你没有权限取消管理员。请联系超级管理员。", toUserName=chat_id)
+                    return True
                 if target_uid == group.get("owner_uid") or target_uid == group.get("initial_admin_uid"):
                     self._itchat.send("不能移除群主或初始管理员。", toUserName=chat_id)
                     return True
@@ -698,6 +822,192 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         self._itchat.send(f"{action}：{label}", toUserName=chat_id)
         logger.info("WeChatUOS ACL: %s %s uid=%s by admin %s/%s in group %s", action, label, target_uid, sender, sender_id, group_name)
         return True
+
+    # ── PanSou 盘搜 ────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _is_pansou_command(text: str) -> Optional[str]:
+        """Check if text starts with 搜索/搜. Returns keyword or None."""
+        if not text:
+            return None
+        s = text.strip()
+        if s.startswith("搜索"):
+            kw = s[2:].strip()
+            return kw if kw else None
+        if s.startswith("搜 ") or s.startswith("搜"):
+            kw = s[2:].strip() if len(s) > 2 else ""
+            return kw if kw else None
+        return None
+
+    def _pansou_is_enabled(self, group_id: str) -> bool:
+        with self._acl_lock:
+            return self._group_acl(group_id, "").get("pansou_enabled", True)
+
+    def _handle_pansou_search(self, text: str, group_id: str, group_name: str, sender: str = "", sender_id: str = "") -> Optional[bool]:
+        """Handle 搜索/搜 keyword. Returns True if consumed, None if not a search command."""
+        keyword = self._is_pansou_command(text)
+        if keyword is None:
+            return None
+        if self._itchat is None:
+            return True
+        # Check if pansou is enabled for this group
+        if not self._pansou_is_enabled(group_id):
+            return True
+        # Check sender permission: admin or allowed_users can search
+        # Always enforce — do NOT skip when sender_id/sender are empty.
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            if not group.get("authorized"):
+                self._itchat.send("本群尚未开启 Hermes，请先发送：开启授权", toUserName=group_id)
+                return True
+            if not sender_id and not sender:
+                self._itchat.send("无法识别发送者身份，盘搜搜索已拒绝。", toUserName=group_id)
+                return True
+            if not self._is_group_admin(group, sender, sender_id) and sender_id not in group.get("allowed_users", []):
+                self._itchat.send("你没有使用盘搜的权限。请联系管理员为你授权。", toUserName=group_id)
+                return True
+        logger.info("WeChatUOS PanSou: searching '%s' in %s", keyword, group_name)
+        try:
+            results = self._search_pansou(keyword)
+        except Exception as e:
+            logger.exception("WeChatUOS PanSou: API error for '%s'", keyword)
+            self._itchat.send(f"[盘搜] API 请求失败: {e}", toUserName=group_id)
+            return True
+        self._send_pansou_results(keyword, results, group_id)
+        return True
+
+    def _search_pansou(self, keyword: str) -> List[Dict[str, Any]]:
+        """Call PanSou API, return results grouped by source type."""
+        url = f"{PANSW_API}?kw={_urlquote(keyword)}&page=1&size=400"
+        req = _URLRequest(url, headers={"User-Agent": "Hermes-WeChatUOS/1.0"})
+        with _urlopen(req, timeout=15) as resp:
+            raw = json.loads(resp.read().decode("utf-8"), strict=False)
+        merged = raw.get("data", {}).get("merged_by_type", {})
+        results: List[Dict[str, Any]] = []
+        for src_type, items in merged.items():
+            if str(src_type).lower() not in PANSOU_ALLOWED_TYPES:
+                continue
+            for item in items[:5]:
+                url_str = item.get("url", "")
+                pw = item.get("password", "")
+                if pw:
+                    url_str = f"{url_str} 密码:{pw}"
+                results.append({
+                    "source": str(src_type).lower(),
+                    "note": item.get("note", ""),
+                    "url_str": url_str,
+                    "datetime": item.get("datetime", ""),
+                })
+        results.sort(key=lambda x: x.get("datetime", ""), reverse=True)
+        return results
+
+    def _send_pansou_results(self, keyword: str, results: List[Dict[str, Any]], group_id: str) -> None:
+        """Send search results to group, grouped by pan type, each as a separate message."""
+        if not results:
+            self._itchat.send(f"🔍 搜索「{keyword}」没找到匹配的资源", toUserName=group_id)
+            return
+
+        # Group by source type
+        grouped: Dict[str, List[Dict[str, Any]]] = {}
+        for r in results:
+            grouped.setdefault(r["source"], []).append(r)
+
+        # Send header message first
+        self._itchat.send(f"🔍 搜索「{keyword}」共 {len(results)} 条结果", toUserName=group_id)
+
+        # Send one message per pan type
+        for src_type, items in grouped.items():
+            label = PANSOU_SOURCE_LABELS.get(src_type, src_type)
+            lines = [f"━━━ {label} ━━━"]
+            for i, item in enumerate(items[:5], 1):
+                lines.append(f"{i}. {item['note']}")
+                lines.append(f"   📎 {item['url_str']}")
+            self._itchat.send("\n".join(lines), toUserName=group_id)
+
+    def _handle_pansou_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        """Handle 开启盘搜 / 关闭盘搜 commands. Returns True if consumed."""
+        s = (text or "").strip().lower()
+        compact = s.replace(" ", "")
+        if compact not in ("开启盘搜", "关闭盘搜"):
+            return False
+        if self._itchat is None:
+            return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            self._remember_member(group, sender_id, nick=sender, display=sender)
+            if not group.get("authorized"):
+                self._itchat.send("本群尚未开启 Hermes，请先发送：开启授权", toUserName=group_id)
+                return True
+            if not self._is_group_admin(group, sender, sender_id):
+                self._itchat.send("你没有权限管理盘搜。", toUserName=group_id)
+                return True
+            is_enable = compact == "开启盘搜"
+            group["pansou_enabled"] = is_enable
+            group["updated_at"] = int(time.time())
+            self._save_acl()
+        status = "已开启" if is_enable else "已关闭"
+        self._itchat.send(f"✅ 盘搜{status}，{'管理员和已授权成员可使用「搜索 xxx」' if is_enable else ''}", toUserName=group_id)
+        logger.info("WeChatUOS PanSou: %s for %s by %s/%s", "enabled" if is_enable else "disabled", group_name, sender, sender_id)
+        return True
+
+    def _handle_tg_fwd_toggle_command(self, compact: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        """Handle 开启转发 / 关闭转发 commands. Returns True if consumed."""
+        if compact not in ("开启转发", "关闭转发", "开启tg转发", "关闭tg转发"):
+            return False
+        if self._itchat is None:
+            return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            self._remember_member(group, sender_id, nick=sender, display=sender)
+            if not group.get("authorized"):
+                self._itchat.send("本群尚未开启 Hermes，请先发送：开启授权", toUserName=group_id)
+                return True
+            if not self._is_group_admin(group, sender, sender_id):
+                self._itchat.send("你没有权限管理 TG 转发。", toUserName=group_id)
+                return True
+        is_enable = compact in ("开启转发", "开启tg转发")
+        gs_path = TG_FWD_DIR / "group_state.json"
+        gstate = {}
+        if gs_path.exists():
+            try:
+                gstate = json.loads(gs_path.read_text())
+            except Exception:
+                pass
+        gstate[group_id] = {"enabled": is_enable, "updated_at": int(time.time())}
+        gs_path.write_text(json.dumps(gstate, ensure_ascii=False, indent=2))
+        status = "已开启" if is_enable else "已关闭"
+        self._itchat.send(f"✅ TG 转发{status}", toUserName=group_id)
+        logger.info("WeChatUOS TG_fwd: %s for %s by %s/%s", status, group_name, sender, sender_id)
+        return True
+
+    def _auto_add_tg_fwd_group(self, group_id: str, group_name: str) -> None:
+        """Auto-add a group to TG forward rules and enable forwarding."""
+        import json
+        if not TG_FWD_CONFIG.exists():
+            return
+        cfg = json.loads(TG_FWD_CONFIG.read_text())
+        changed = False
+        for rule in cfg.get("forward_rules", []):
+            groups = rule.get("wechat_groups", [])
+            if group_id not in groups:
+                groups.append(group_id)
+                changed = True
+        if changed:
+            TG_FWD_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+        # Also set enabled=True in group_state
+        gs_path = TG_FWD_DIR / "group_state.json"
+        gstate = {}
+        if gs_path.exists():
+            try:
+                gstate = json.loads(gs_path.read_text())
+            except Exception:
+                pass
+        entry = gstate.setdefault(group_id, {})
+        if not entry.get("enabled"):
+            entry["enabled"] = True
+            entry["updated_at"] = int(time.time())
+            gs_path.write_text(json.dumps(gstate, ensure_ascii=False, indent=2))
+        logger.info("WeChatUOS TG_fwd: auto-added group %s (%s) to forward rules", group_name, group_id[:16])
 
     def _submit_event(self, *, text: str, chat_id: str, chat_name: str, chat_type: str, user_id: str, user_name: str, raw: Any) -> None:
         if not self._loop:
@@ -726,6 +1036,881 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         asyncio.run_coroutine_threadsafe(self.handle_message(event), self._loop)
+
+
+    # ── TG Channel → WeChat forwarder (uses adapter's itchat instance) ──
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  CFTC Upload Methods
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _register_cftc_media_handlers(self) -> None:
+        """Register itchat handlers for media messages (PICTURE/VIDEO/ATTACHMENT)."""
+        if self._itchat is None:
+            return
+        import itchat
+        from itchat.content import PICTURE, VIDEO, ATTACHMENT
+
+        @itchat.msg_register(PICTURE, isGroupChat=True)
+        def group_picture_handler(msg):
+            self._cftc_cache_media_msg(msg)
+
+        @itchat.msg_register(VIDEO, isGroupChat=True)
+        def group_video_handler(msg):
+            self._cftc_cache_media_msg(msg)
+
+        @itchat.msg_register(ATTACHMENT, isGroupChat=True)
+        def group_attachment_handler(msg):
+            self._cftc_cache_media_msg(msg)
+
+        logger.info("WeChatUOS CFTC: media handlers registered")
+
+    def _cftc_cache_media_msg(self, msg) -> None:
+        """Cache a media message for potential upload."""
+        group_id = getattr(msg, "fromUserName", None) or msg.get("FromUserName", "")
+        if not group_id:
+            return
+        file_name = getattr(msg, "fileName", None) or msg.get("FileName", "unknown")
+        new_msg_id = getattr(msg, "newMsgId", None) or msg.get("NewMsgId", 0)
+        msg_id = getattr(msg, "msgId", None) or msg.get("MsgId", 0)
+        now = time.time()
+        entry = {
+            "path": CFTC_MEDIA_DIR / f"cftc_{new_msg_id}_{file_name}",
+            "name": file_name,
+            "msg_id": str(msg_id),
+            "new_msg_id": str(new_msg_id),
+            "size": getattr(msg, "fileSize", None) or msg.get("FileSize", 0),
+            "time": now,
+        }
+        CFTC_MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+        try:
+            if hasattr(msg, "download"): msg.download(str(entry["path"]))
+            else: msg["Text"](str(entry["path"]))
+        except Exception as e:
+            logger.warning("CFTC: media download failed: %s", e)
+            return
+        cache = self._cftc_recent_media.setdefault(group_id, [])
+        cache.append(entry)
+        if len(cache) > 10:
+            oldest = cache.pop(0)
+            self._cftc_remove_file(oldest["path"])
+        self._cftc_processed_ids.add(str(new_msg_id))
+        logger.info("CFTC: cached media %s for group %s", file_name, group_id)
+
+    def _cftc_remove_file(self, path) -> None:
+        try:
+            if path and hasattr(path, "exists") and path.exists():
+                path.unlink()
+        except Exception: pass
+
+    def _cftc_clean_expired(self, group_id: str) -> None:
+        cache = self._cftc_recent_media.get(group_id, [])
+        now = time.time()
+        fresh = [e for e in cache if now - e["time"] < 600]
+        for e in cache:
+            if now - e["time"] >= 600: self._cftc_remove_file(e["path"])
+        self._cftc_recent_media[group_id] = fresh
+
+    def _cftc_find_latest(self, group_id: str) -> dict:
+        self._cftc_clean_expired(group_id)
+        cache = self._cftc_recent_media.get(group_id, [])
+        return cache[-1] if cache else {}
+
+    def _cftc_upload_file(self, file_path, file_name, storage_type="telegram") -> str:
+        """Upload a file to CFTC server. Returns URL or empty string.
+
+        Uses the CFTC v2 API: POST /login → POST /upload (multipart FormData).
+        """
+        try:
+            import json
+            import os
+            import subprocess
+            import tempfile
+
+            cfg_path = CFTC_CONFIG_FILE
+            if not cfg_path.exists():
+                return ""
+            cfg = json.loads(cfg_path.read_text())
+            cftc_url = cfg.get("cftc_url", "https://cftc.lliic.com")
+            username = cfg.get("cftc_username", "")
+            password = cfg.get("cftc_password", "")
+            if not username or not password:
+                return ""
+
+            cookie_file = CFTC_COOKIE_FILE if CFTC_COOKIE_FILE.exists() else None
+            jar = tempfile.NamedTemporaryFile(prefix="cftc_jar_", suffix=".txt", delete=False)
+            jar_path = jar.name
+            jar.close()
+
+            if cookie_file:
+                with open(cookie_file) as f:
+                    saved = json.load(f)
+                old_cookie = saved.get("cookie", "")
+                # Write Netscape cookie format for curl
+                # Parse "auth_token=xxx; Path=/; HttpOnly; Secure; ..."
+                if old_cookie and "auth_token" in old_cookie:
+                    token_part = old_cookie.split(";")[0].strip()
+                    with open(jar_path, "w") as jf:
+                        jf.write("# Netscape HTTP Cookie File\n")
+                        jf.write(f"cftc.lliic.com\tFALSE\t/\tTRUE\t0\t{token_part}\n")
+
+            # Login if needed (try upload first, login on auth failure)
+            # Use curl -F for clean multipart upload
+            result = subprocess.run(
+                ["curl", "-s", "-b", jar_path, "-c", jar_path,
+                 "-X", "POST", f"{cftc_url}/login",
+                 "-H", "Content-Type: application/json",
+                 "-d", json.dumps({"username": username, "password": password})],
+                capture_output=True, text=True, timeout=15,
+            )
+
+            # Save cookie for next time
+            saved_cookie = ""
+            if os.path.exists(jar_path):
+                with open(jar_path) as jf:
+                    saved_cookie = jf.read()
+                CFTC_COOKIE_FILE.write_text(json.dumps({"cookie": saved_cookie}))
+
+            # Upload via curl -F
+            upload_result = subprocess.run(
+                ["curl", "-s", "-b", jar_path, "-c", jar_path,
+                 "-X", "POST", f"{cftc_url}/upload",
+                 "-F", f"file=@{file_path};filename={file_name}",
+                 "-F", "category=",
+                 "-F", f"storage_type={storage_type}"],
+                capture_output=True, text=True, timeout=120,
+            )
+            os.unlink(jar_path)
+
+            resp = json.loads(upload_result.stdout)
+            if resp.get("status") == 1:
+                return resp.get("url", "")
+            logger.warning("CFTC: upload failed: %s", resp.get("msg", "unknown"))
+            return ""
+        except Exception:
+            logger.exception("CFTC: upload error")
+            return ""
+
+    def _handle_cftc_toggle_command(self, compact: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        compact = compact.strip()
+        if compact not in {"开启上传", "关闭上传"}:
+            return False
+        if self._itchat is None: return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            self._remember_member(group, sender_id, nick=sender, display=sender)
+            if not group.get("authorized"):
+                self._itchat.send("当前群尚未授权。请发送：@机器人 开启授权 或 授权此群聊", toUserName=group_id); return True
+            if not self._is_group_admin(group, sender, sender_id):
+                self._itchat.send("你没有权限管理本群机器人。", toUserName=group_id); return True
+            enabled = compact == "开启上传"
+            group["cftc_enabled"] = enabled; group["updated_at"] = int(time.time()); self._save_acl()
+        self._itchat.send(f"✅ 图床上传已{'开启' if enabled else '关闭'}", toUserName=group_id)
+        logger.info("CFTC: %s for group %s by %s/%s", "enabled" if enabled else "disabled", group_name, sender, sender_id)
+        return True
+
+    def _handle_cftc_upload_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        s = text.strip().lower().replace(" ", "")
+        if s == "上传" or s.startswith("上传"):
+            if self._itchat is None: return True
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                if not group.get("authorized"):
+                    self._itchat.send("当前群尚未授权。请发送：@机器人 开启授权 或 授权此群聊", toUserName=group_id); return True
+                if not group.get("cftc_enabled", True):
+                    self._itchat.send("本群图床上传已关闭。", toUserName=group_id); return True
+                if not self._can_use_group(group_id, group_name, sender, sender_id): return True
+            parts = text.strip().split()
+            storage_type = parts[-1].strip().lower() if len(parts) >= 2 and parts[-1].strip().lower() in ("telegram", "r2") else "telegram"
+            media = self._cftc_find_latest(group_id)
+            if not media:
+                self._itchat.send("没有找到可上传的媒体文件。请先发送图片/文件到群聊。", toUserName=group_id); return True
+            fp = media["path"]
+            if not fp.exists():
+                self._itchat.send("媒体文件已过期，请重新发送。", toUserName=group_id); return True
+            self._itchat.send(f"⏫ 正在上传 {media['name']} 到 CFTC...", toUserName=group_id)
+            url = self._cftc_upload_file(fp, media["name"], storage_type)
+            self._itchat.send(f"✅ 上传成功：{url}" if url else "上传失败，请重试。", toUserName=group_id)
+            return True
+        return False
+
+    # ═══════════════════════════════════════════════════════════════════════
+    #  LSPosed Module Tracker Methods
+    # ═══════════════════════════════════════════════════════════════════════
+
+    def _start_lsposed_tracker(self) -> None:
+        if self._lsposed_thread and self._lsposed_thread.is_alive(): return
+        self._lsposed_stop.clear()
+        self._lsposed_thread = threading.Thread(target=self._lsposed_poll_loop, name="wechat-uos-lsposed", daemon=True)
+        self._lsposed_thread.start()
+        logger.info("WeChatUOS LSPosed: tracker started")
+
+    def _lsposed_poll_loop(self) -> None:
+        logger.info("WeChatUOS LSPosed: poll loop started")
+        first_run = True
+        while not self._lsposed_stop.is_set():
+            try:
+                cfg = self._lsposed_load_config()
+                if cfg.get("enabled", False): self._lsposed_run_once(cfg, first_run)
+                first_run = False
+            except Exception: logger.exception("WeChatUOS LSPosed: poll error")
+            for _ in range(1800 // 5):
+                if self._lsposed_stop.is_set(): return
+                time.sleep(5)
+
+    def _lsposed_load_config(self) -> dict:
+        default = {"enabled": True, "target_groups": [], "interval_seconds": 1800, "max_updates_per_tick": 10,
+            "modules_url": "https://modules.lsposed.org/modules.json", "custom_repos": [], "web_sources": [],
+            "pkl_path": str(PKL_FILE), "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36"}
+        try:
+            if LSPOSED_CONFIG.exists(): data = json.loads(LSPOSED_CONFIG.read_text())
+            else: data = {}
+            for k, v in default.items(): data.setdefault(k, v)
+            return data
+        except Exception: logger.exception("LSPosed: config load error")
+        LSPOSED_DIR.mkdir(parents=True, exist_ok=True)
+        LSPOSED_CONFIG.write_text(json.dumps(default, ensure_ascii=False, indent=2))
+        return dict(default)
+
+    def _lsposed_save_state(self, state: dict) -> None:
+        LSPOSED_DIR.mkdir(parents=True, exist_ok=True); LSPOSED_STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+    def _lsposed_load_state(self) -> dict:
+        try:
+            if LSPOSED_STATE_FILE.exists(): return json.loads(LSPOSED_STATE_FILE.read_text())
+        except Exception: pass
+        return {"modules": {}, "custom_repos": {}, "web_sources": {}}
+
+    def _lsposed_run_once(self, cfg: dict, first_run: bool) -> int:
+        state = self._lsposed_load_state(); updates = []; max_up = cfg.get("max_updates_per_tick", 10)
+        modules = self._lsposed_fetch_modules(cfg)
+        if modules:
+            for mod in modules:
+                if len(updates) >= max_up: break
+                mname = mod.get("name", "") or mod.get("moduleName", "")
+                if not mname: continue
+                ver = mod.get("version", "") or mod.get("versionName", "") or "0"
+                old_ver = state.get("modules", {}).get(mname, "")
+                if ver and ver != old_ver: updates.append({"type": "module", "name": mname, "version": ver, "old_version": old_ver, "mod": mod})
+            state.setdefault("modules", {}).update({u["name"]: u["version"] for u in updates})
+        import urllib.request
+        for repo in cfg.get("custom_repos", []):
+            if len(updates) >= max_up: break
+            owner, repo_name, label = repo.get("owner", ""), repo.get("repo", ""), repo.get("name", f"{repo.get('owner','?')}/{repo.get('repo','?')}")
+            if not owner or not repo_name: continue
+            try:
+                req = urllib.request.Request(f"https://api.github.com/repos/{owner}/{repo_name}/releases/latest", headers={"User-Agent": cfg.get("user_agent"), "Accept": "application/json"})
+                with urllib.request.urlopen(req, timeout=15) as resp: release = json.loads(resp.read())
+                tag = release.get("tag_name", "")
+                old_tag = state.get("custom_repos", {}).get(f"{owner}/{repo_name}", "")
+                if tag and tag != old_tag:
+                    asset = (release.get("assets") or [{}])[0]
+                    updates.append({"type": "custom", "name": label, "version": tag, "old_version": old_tag, "url": asset.get("browser_download_url", ""), "body": (release.get("body") or "")[:500]})
+                state.setdefault("custom_repos", {})[f"{owner}/{repo_name}"] = tag
+            except Exception: logger.debug("LSPosed: GitHub fetch failed for %s/%s", owner, repo_name)
+        self._lsposed_save_state(state)
+        if first_run:
+            logger.info("LSPosed: baseline %d modules, %d custom repos", len(state.get("modules", {})), len(state.get("custom_repos", {})))
+            return 0
+        if not updates: return 0
+        groups = cfg.get("target_groups", [])
+        # Load ACL once for permission checks
+        with self._acl_lock:
+            acl_groups = json.loads(ACL_FILE.read_text()).get("groups", {}) if ACL_FILE.exists() else {}
+        for up in updates[:max_up]:
+            msg = self._lsposed_format_update(up)
+            sent = False
+            for gid in groups:
+                if not self._itchat:
+                    break
+                group_info = acl_groups.get(gid, {})
+                if not group_info.get("authorized") or not group_info.get("lsposed_enabled"):
+                    continue
+                try:
+                    self._itchat.send(msg, toUserName=gid)
+                    time.sleep(0.5)
+                    sent = True
+                except Exception:
+                    logger.warning("LSPosed: send to %s failed", gid)
+            if sent:
+                logger.info("LSPosed: pushed update for %s -> %s", up["name"], up["version"])
+        return len(updates)
+
+    def _lsposed_fetch_modules(self, cfg: dict) -> list:
+        """Fetch Xposed modules via GitHub GraphQL API. Falls back to local cache."""
+        token = cfg.get("github_token", "")
+        org = cfg.get("org", "Xposed-Modules-Repo")
+        if token:
+            try:
+                modules = self._lsposed_fetch_via_github(org, token, cfg)
+                if modules:
+                    # Cache to local file
+                    output = cfg.get("output_file", str(LSPOSED_DIR / "modules.json"))
+                    LSPOSED_DIR.mkdir(parents=True, exist_ok=True)
+                    with open(output, "w") as f: json.dump(modules, f, ensure_ascii=False)
+                    logger.info("LSPosed: cached %d modules from GitHub", len(modules))
+                    return modules
+            except Exception as e:
+                logger.debug("LSPosed: GitHub API failed: %s", e)
+        # Fallback: local cache
+        cache_path = cfg.get("output_file", str(LSPOSED_DIR / "modules.json"))
+        try:
+            if os.path.exists(cache_path):
+                with open(cache_path) as f: data = json.load(f)
+                if isinstance(data, list): return data
+                if isinstance(data, dict): return data.get("modules", data.get("data", []))
+        except Exception: logger.debug("LSPosed: cache fallback failed for %s", cache_path)
+        return []
+
+    def _lsposed_fetch_via_github(self, org: str, token: str, cfg: dict) -> list:
+        """Fetch all repos (modules) from a GitHub org via GraphQL API, paginated."""
+        import ssl
+        results = []
+        cursor = None
+        has_next = True
+        ua = cfg.get("user_agent", "Hermes/1.0")
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "User-Agent": ua,
+            "Content-Type": "application/json",
+        }
+        # Explicitly create an unverified SSL context so we don't fail on edge cases
+        ctx = ssl.create_default_context()
+
+        while has_next:
+            after = f'"{cursor}"' if cursor else "null"
+            query = f"""
+            query {{
+              organization(login: "{org}") {{
+                repositories(first: 100, after: {after}, orderBy: {{field: UPDATED_AT, direction: DESC}}) {{
+                  pageInfo {{ hasNextPage endCursor }}
+                  nodes {{
+                    name
+                    description
+                    homepageUrl
+                    url
+                    stargazerCount
+                    createdAt
+                    updatedAt
+                    isArchived
+                    repositoryTopics(first: 5) {{ nodes {{ topic {{ name }} }} }}
+                    latestRelease {{
+                      tagName
+                      isPrerelease
+                      isDraft
+                      name
+                      description
+                      createdAt
+                      publishedAt
+                      releaseAssets(first: 5) {{
+                        nodes {{ name contentType downloadCount size downloadUrl }}
+                      }}
+                    }}
+                    latestBetaRelease: latestRelease {{
+                      tagName
+                    }}
+                    latestSnapshotRelease: latestRelease {{
+                      tagName
+                    }}
+                  }}
+                }}
+              }}
+            }}
+            """
+            req = urllib.request.Request(
+                "https://api.github.com/graphql",
+                data=json.dumps({"query": query}).encode(),
+                headers=headers,
+            )
+            with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+                body = json.loads(resp.read())
+            if "errors" in body:
+                logger.warning("LSPosed GraphQL errors: %s", body["errors"])
+                break
+            org_data = body.get("data", {}).get("organization", {})
+            repos = org_data.get("repositories", {})
+            page_info = repos.get("pageInfo", {})
+            has_next = page_info.get("hasNextPage", False)
+            cursor = page_info.get("endCursor")
+            for node in repos.get("nodes", []):
+                if node.get("isArchived") or node.get("name", "").startswith("."):
+                    continue
+                lr = node.pop("latestRelease", None) or {}
+                # Normalize to match expected format
+                entry = {
+                    "name": node.get("name", ""),
+                    "description": node.get("description", ""),
+                    "url": node.get("url", ""),
+                    "homepageUrl": node.get("homepageUrl", ""),
+                    "stargazerCount": node.get("stargazerCount", 0),
+                    "updatedAt": node.get("updatedAt", ""),
+                    "createdAt": node.get("createdAt", ""),
+                    "latestRelease": lr,
+                    "latestBetaRelease": None,
+                    "latestSnapshotRelease": None,
+                    "latestReleaseTime": lr.get("publishedAt", lr.get("createdAt", "")),
+                    "latestBetaReleaseTime": "1970-01-01T00:00:00Z",
+                    "latestSnapshotReleaseTime": "1970-01-01T00:00:00Z",
+                }
+                # Check topics for isModule flag
+                topics = node.get("repositoryTopics", {}).get("nodes", [])
+                entry["isModule"] = any(t.get("topic", {}).get("name") == "xposed-module" for t in topics)
+                results.append(entry)
+            logger.info("LSPosed: fetched page (%d repos so far, hasNext=%s)", len(results), has_next)
+        return results
+
+    def _lsposed_format_update(self, up: dict) -> str:
+        t = up.get("type", "unknown"); name = up.get("name", "?"); ver = up.get("version", "?"); old_ver = up.get("old_version", "")
+        lines = [f"📦 {name}", f"版本：{ver}"]
+        if old_ver: lines.append(f"旧版本：{old_ver}")
+        if t == "custom":
+            dl_url = up.get("url", ""); body = up.get("body", "")
+            if dl_url: lines.append(f"下载：{dl_url}")
+            if body: lines.append(f"说明：{body[:200]}")
+        lines.append("")
+        return "\\n".join(lines)
+
+    def _handle_lsposed_text_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        s = text.strip().lower().replace(" ", "")
+        if s not in {"开启更新", "关闭更新", "模块更新状态"}: return False
+        if self._itchat is None: return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            self._remember_member(group, sender_id, nick=sender, display=sender)
+            if not group.get("authorized"): self._itchat.send("当前群尚未授权。", toUserName=group_id); return True
+            if not self._is_group_admin(group, sender, sender_id): self._itchat.send("你没有权限。", toUserName=group_id); return True
+        if s == "开启更新":
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                group["lsposed_enabled"] = True
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+            self._itchat.send("✅ 模块更新已开启", toUserName=group_id)
+            logger.info("LSPosed: enabled for %s by %s/%s", group_name, sender, sender_id)
+            return True
+        if s == "关闭更新":
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                group["lsposed_enabled"] = False
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+            self._itchat.send("✅ 模块更新已关闭", toUserName=group_id)
+            logger.info("LSPosed: disabled for %s by %s/%s", group_name, sender, sender_id)
+            return True
+        if s == "模块更新状态":
+            cfg = self._lsposed_load_config()
+            state = self._lsposed_load_state()
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                enabled = "🟢 已开启" if group.get("lsposed_enabled") else "🔴 已关闭"
+            self._itchat.send(f"模块更新：{enabled}\\n已跟踪：{len(state.get('modules',{}))} 个模块\\n自定义仓库：{len(cfg.get('custom_repos',[]))} 个", toUserName=group_id)
+            return True
+        return False
+
+    def _handle_werss_text_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        s = text.strip().lower().replace(" ", "")
+        if s not in {"开启推文", "关闭推文"}: return False
+        if self._itchat is None: return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            self._remember_member(group, sender_id, nick=sender, display=sender)
+            if not group.get("authorized"): self._itchat.send("当前群尚未授权。", toUserName=group_id); return True
+            if not self._is_group_admin(group, sender, sender_id): self._itchat.send("你没有权限。", toUserName=group_id); return True
+        if s == "开启推文":
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                group["werss_enabled"] = True
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+            self._itchat.send("✅ 公众号推文推送已开启", toUserName=group_id)
+            logger.info("WeRSS: enabled for %s by %s/%s", group_name, sender, sender_id)
+            return True
+        if s == "关闭推文":
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                group["werss_enabled"] = False
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+            self._itchat.send("✅ 公众号推文推送已关闭", toUserName=group_id)
+            logger.info("WeRSS: disabled for %s by %s/%s", group_name, sender, sender_id)
+            return True
+        return False
+
+    def _start_werss_poller(self) -> None:
+        if self._werss_thread and self._werss_thread.is_alive(): return
+        self._werss_stop.clear()
+        self._werss_thread = threading.Thread(target=self._werss_poll_loop, name="wechat-uos-werss", daemon=True)
+        self._werss_thread.start()
+        logger.info("WeChatUOS WeRSS: poller started")
+
+    def _werss_login(self) -> Optional[str]:
+        try:
+            data = _urlopen(
+                _URLRequest(
+                    f"{WERSS_BASE}/auth/login",
+                    data=_urlencode({"username": WERSS_USER, "password": WERSS_PASS}).encode(),
+                    headers={"Content-Type": "application/x-www-form-urlencoded"},
+                ),
+                timeout=10,
+            ).read()
+            resp = json.loads(data)
+            return resp.get("data", {}).get("access_token")
+        except Exception:
+            logger.exception("WeChatUOS WeRSS: login failed")
+            return None
+
+    def _werss_fetch_articles(self, token: str) -> List[Dict[str, Any]]:
+        try:
+            data = _urlopen(
+                _URLRequest(
+                    f"{WERSS_BASE}/articles?offset=0&limit=20",
+                    headers={"Authorization": f"Bearer {token}"},
+                ),
+                timeout=15,
+            ).read()
+            resp = json.loads(data)
+            return resp.get("data", {}).get("list", [])
+        except Exception:
+            logger.exception("WeChatUOS WeRSS: fetch articles failed")
+            return []
+
+    def _werss_poll_loop(self) -> None:
+        logger.info("WeChatUOS WeRSS: poll loop started")
+        WERSS_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+        last_creates: set = set()
+        if WERSS_STATE_FILE.exists():
+            try:
+                st = json.loads(WERSS_STATE_FILE.read_text())
+                last_creates = set(st.get("seen_ids", []))
+            except Exception:
+                pass
+        while not self._werss_stop.is_set():
+            try:
+                token = self._werss_login()
+                if not token:
+                    time.sleep(60)
+                    continue
+                articles = self._werss_fetch_articles(token)
+                new_articles = [a for a in articles if a.get("id") not in last_creates]
+                if new_articles:
+                    # Mark all fetched IDs as seen
+                    fresh_ids = set()
+                    # Separate 集客之家 articles for batch pushing
+                    jk_articles = [a for a in new_articles if a.get("mp_name", "") == "集客之家"]
+                    other_articles = [a for a in new_articles if a.get("mp_name", "") != "集客之家"]
+                    # Push non-集客之家 articles individually
+                    for a in other_articles:
+                        fresh_ids.add(a.get("id", ""))
+                        self._werss_push_article(a)
+                    # Push 集客之家 articles in batches of 3 (newest 3 merged)
+                    if jk_articles:
+                        jk_articles.sort(key=lambda a: a.get("publish_time", 0) or a.get("id", ""), reverse=True)
+                        batch = jk_articles[:3]
+                        for a in batch:
+                            fresh_ids.add(a.get("id", ""))
+                        self._werss_push_article_batch(batch)
+                    last_creates |= fresh_ids
+                    # Prune to last 200 IDs
+                    if len(last_creates) > 200:
+                        last_creates = set(sorted(last_creates, reverse=True)[:200])
+                    try:
+                        WERSS_STATE_FILE.write_text(json.dumps({
+                            "seen_ids": sorted(last_creates),
+                            "updated_at": int(time.time()),
+                        }, ensure_ascii=False))
+                    except Exception:
+                        pass
+            except Exception:
+                logger.exception("WeChatUOS WeRSS: poll loop error")
+            self._werss_stop.wait(WERSS_POLL_INTERVAL)
+        logger.info("WeChatUOS WeRSS: poll loop stopped")
+
+    def _werss_push_article(self, article: Dict[str, Any]) -> None:
+        try:
+            art_id = article.get("id", "")
+            mp_name = article.get("mp_name", "未知公众号")
+            title = article.get("title", "无标题")
+            url = article.get("url", "")
+            desc = article.get("description", "")
+            # Format message
+            msg = f"📰 {mp_name}\n{title}"
+            if desc:
+                msg += f"\n{desc}"
+            if url:
+                msg += f"\n{url}"
+            # Get enabled groups
+            with self._acl_lock:
+                groups = []
+                for gid, g in list(self._acl.get("groups", {}).items()):
+                    if g.get("authorized") and g.get("werss_enabled", True):
+                        groups.append(gid)
+            for gid in groups:
+                try:
+                    if self._itchat:
+                        self._itchat.send(msg, toUserName=gid)
+                        time.sleep(0.5)  # rate limit
+                except Exception:
+                    logger.exception("WeChatUOS WeRSS: push to %s failed", gid[:16])
+        except Exception:
+            logger.exception("WeChatUOS WeRSS: push article failed")
+
+    def _werss_push_article_batch(self, articles: List[Dict[str, Any]]) -> None:
+        """Push multiple articles from the same account as a single merged message."""
+        if not articles:
+            return
+        try:
+            mp_name = articles[0].get("mp_name", "未知公众号")
+            lines = [f"📰 {mp_name}"]
+            for i, art in enumerate(articles, 1):
+                title = art.get("title", "无标题")
+                url = art.get("url", "")
+                desc = art.get("description", "")
+                lines.append("")
+                lines.append(f"─── {i} ───")
+                lines.append(title)
+                if desc:
+                    lines.append(desc)
+                if url:
+                    lines.append(url)
+            msg = "\n".join(lines)
+            with self._acl_lock:
+                groups = []
+                for gid, g in list(self._acl.get("groups", {}).items()):
+                    if g.get("authorized") and g.get("werss_enabled", True):
+                        groups.append(gid)
+            for gid in groups:
+                try:
+                    if self._itchat:
+                        self._itchat.send(msg, toUserName=gid)
+                        time.sleep(0.5)
+                except Exception:
+                    logger.exception("WeChatUOS WeRSS: batch push to %s failed", gid[:16])
+        except Exception:
+            logger.exception("WeChatUOS WeRSS: batch push failed")
+
+    def _migrate_external_gid(self, old_gid: str, new_gid: str, group_name: str) -> None:
+        """Migrate GID in TG forward config and CFTC group state after ACL restoration."""
+        try:
+            # 1. Migrate TG forward config.json
+            if TG_FWD_CONFIG.exists():
+                cfg = json.loads(TG_FWD_CONFIG.read_text())
+                changed = False
+                for rule in cfg.get("forward_rules", []):
+                    groups = rule.get("wechat_groups", [])
+                    for i, gid in enumerate(groups):
+                        if gid == old_gid:
+                            groups[i] = new_gid
+                            changed = True
+                if changed:
+                    TG_FWD_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+                    logger.info("WeChatUOS GID migration: updated tg_fwd config %s: %s -> %s", group_name, old_gid[:16], new_gid[:16])
+
+            # 2. Migrate CFTC group state
+            cftc_state_file = CFTC_DIR / "group_state.json"
+            if cftc_state_file.exists():
+                cftc_state = json.loads(cftc_state_file.read_text())
+                if old_gid in cftc_state:
+                    cftc_state[new_gid] = cftc_state.pop(old_gid)
+                    cftc_state_file.write_text(json.dumps(cftc_state, ensure_ascii=False, indent=2))
+                    logger.info("WeChatUOS GID migration: updated CFTC state %s: %s -> %s", group_name, old_gid[:16], new_gid[:16])
+
+            # 3. Migrate TG forward group_state.json
+            tg_state_file = TG_FWD_DIR / "group_state.json"
+            if tg_state_file.exists():
+                tg_state = json.loads(tg_state_file.read_text())
+                if old_gid in tg_state:
+                    tg_state[new_gid] = tg_state.pop(old_gid)
+                    tg_state_file.write_text(json.dumps(tg_state, ensure_ascii=False, indent=2))
+                    logger.info("WeChatUOS GID migration: updated TG fwd group_state %s: %s -> %s", group_name, old_gid[:16], new_gid[:16])
+
+            # 4. Migrate LSPosed target_groups + sync with ACL
+            lsposed_cfg = HERMES_HOME / "data" / "lsposed_tracker" / "config.json"
+            if lsposed_cfg.exists():
+                lcfg = json.loads(lsposed_cfg.read_text())
+                tg = lcfg.get("target_groups", [])
+                changed = False
+                for i, g in enumerate(tg):
+                    if g == old_gid:
+                        tg[i] = new_gid
+                        changed = True
+                # Sync: ensure all authorized + lsposed_enabled groups are in target_groups
+                try:
+                    acl_groups = json.loads(ACL_FILE.read_text()).get("groups", {}) if ACL_FILE.exists() else {}
+                    for agid, ag in acl_groups.items():
+                        if ag.get("authorized") and ag.get("lsposed_enabled") and agid not in tg:
+                            tg.append(agid)
+                            changed = True
+                except Exception:
+                    logger.debug("WeChatUOS GID migration: LSPosed ACL sync skipped")
+                if changed:
+                    lcfg["target_groups"] = tg
+                    lsposed_cfg.write_text(json.dumps(lcfg, ensure_ascii=False, indent=2))
+                    logger.info("WeChatUOS GID migration: updated LSPosed config %s: %s -> %s (synced %d groups)", group_name, old_gid[:16], new_gid[:16], len(tg))
+
+            # 5. Migrate Pansou group_state
+            pansou_state = HERMES_HOME / "data" / "pansou" / "group_state.json"
+            if pansou_state.exists():
+                ps = json.loads(pansou_state.read_text())
+                if old_gid in ps:
+                    ps[new_gid] = ps.pop(old_gid)
+                    pansou_state.write_text(json.dumps(ps, ensure_ascii=False, indent=2))
+                    logger.info("WeChatUOS GID migration: updated Pansou state %s: %s -> %s", group_name, old_gid[:16], new_gid[:16])
+
+            # 6. Migrate GID name map
+            gid_map_file = STATE_DIR / "gid_name_map.json"
+            if gid_map_file.exists():
+                gm = json.loads(gid_map_file.read_text())
+                changed = False
+                if gm.get("by_name", {}).get(group_name) == old_gid:
+                    gm["by_name"][group_name] = new_gid
+                    changed = True
+                if old_gid in gm.get("by_old_gid", {}):
+                    gm["by_old_gid"][new_gid] = gm["by_old_gid"].pop(old_gid)
+                    changed = True
+                if changed:
+                    gm["updated_at"] = 9999999999
+                    gid_map_file.write_text(json.dumps(gm, ensure_ascii=False, indent=2))
+                    logger.info("WeChatUOS GID migration: updated gid_name_map %s: %s -> %s", group_name, old_gid[:16], new_gid[:16])
+
+        except Exception:
+            logger.exception("WeChatUOS GID migration: error updating external configs for %s", old_gid)
+
+
+
+
+    def _start_tg_fwd(self) -> None:
+        """Start TG forward polling thread. No-op if config not found or thread already running."""
+        if not TG_FWD_CONFIG.exists():
+            logger.info("WeChatUOS TG_fwd: no config at %s, skipping", TG_FWD_CONFIG)
+            return
+        t = threading.Thread(target=self._tg_fwd_poll_loop, name="wechat-uos-tg-fwd", daemon=True)
+        t.start()
+        logger.info("WeChatUOS TG_fwd: poller started")
+
+    def _tg_fwd_poll_loop(self) -> None:
+        """Long-poll Telegram channel and forward new posts to configured WeChat groups."""
+        TG_FWD_CACHE.mkdir(parents=True, exist_ok=True)
+        last_cleanup = 0.0
+        while True:
+            try:
+                # Hot-reload config each tick
+                if not TG_FWD_CONFIG.exists():
+                    time.sleep(30)
+                    continue
+                cfg = json.loads(TG_FWD_CONFIG.read_text())
+                token = cfg.get("bot_token", "")
+                if not token:
+                    time.sleep(30)
+                    continue
+                rules = cfg.get("forward_rules", [])
+                if not rules:
+                    time.sleep(30)
+                    continue
+
+                for rule in rules:
+                    tg_channel = rule.get("tg_channel", "")
+                    wechat_groups = rule.get("wechat_groups", [])
+                    if not tg_channel or not wechat_groups:
+                        continue
+
+                    # Load state
+                    state = _tg_fwd_load_state(tg_channel)
+                    last_update_id = state.get("last_update_id")
+
+                    # Long-poll with 30s timeout
+                    params = {"timeout": 30, "limit": 10, "allowed_updates": json.dumps(["channel_post"])}
+                    if last_update_id:
+                        params["offset"] = last_update_id
+
+                    result = _tg_api_call(token, "getUpdates", params, timeout=35)
+                    if not result.get("ok"):
+                        continue
+
+                    updates = result.get("result", [])
+                    if not updates:
+                        continue
+
+                    for update in updates:
+                        update_id = update.get("update_id")
+                        msg = update.get("channel_post")
+                        if not msg:
+                            continue
+                        msg_id = msg.get("message_id")
+                        if not msg_id:
+                            continue
+                        if state.get("last_msg_id") is not None and msg_id is not None and msg_id <= state.get("last_msg_id", 0):
+                            continue
+
+                        # Format text
+                        formatted = _tg_format(msg)
+                        # Download media if present
+                        media_path = _tg_download_media(token, msg, msg_id, TG_FWD_CACHE) if any(
+                            k in msg for k in ("photo", "video", "document", "audio", "animation", "voice")
+                        ) else None
+
+                        logger.info("WeChatUOS TG_fwd: forwarding msg %s from %s (media: %s)",
+                                     msg_id, tg_channel, media_path.name if media_path else "none")
+
+                        # Send to each configured WeChat group
+                        for wx_group in wechat_groups:
+                            if not _tg_fwd_is_enabled(wx_group):
+                                logger.debug("WeChatUOS TG_fwd: forwarding disabled for %s", wx_group)
+                                continue
+                            itchat = self._itchat
+                            if itchat is None:
+                                continue
+                            # Send text
+                            if formatted:
+                                try:
+                                    itchat.send(formatted, toUserName=wx_group)
+                                except Exception as e:
+                                    logger.error("WeChatUOS TG_fwd: text send to %s failed: %s", wx_group, e)
+                            # Send media
+                            if media_path:
+                                try:
+                                    ext = media_path.suffix.lower()
+                                    if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
+                                        ok = itchat.send_image(str(media_path), toUserName=wx_group)
+                                        if ok is False or ok is None:
+                                            ok = itchat.send_file(str(media_path), toUserName=wx_group)
+                                    else:
+                                        ok = itchat.send_file(str(media_path), toUserName=wx_group)
+                                    if ok is False or ok is None:
+                                        logger.warning("WeChatUOS TG_fwd: media failed for %s -> %s", media_path.name, wx_group)
+                                except Exception as e:
+                                    logger.error("WeChatUOS TG_fwd: media send to %s failed: %s", wx_group, e)
+
+                        # Cleanup media file after forwarding
+                        if media_path and media_path.exists():
+                            try:
+                                media_path.unlink()
+                            except Exception:
+                                pass
+
+                        # Update state
+                        if msg_id is not None:
+                            state["last_msg_id"] = msg_id
+                        state["last_update_id"] = update_id + 1
+
+                    _tg_fwd_save_state(tg_channel, state)
+
+                # Periodic media cache cleanup (every 5 min)
+                now = time.time()
+                if now - last_cleanup > 300:
+                    last_cleanup = now
+                    try:
+                        cutoff = now - 3600
+                        for f in TG_FWD_CACHE.iterdir():
+                            if f.is_file() and f.stat().st_mtime < cutoff:
+                                f.unlink()
+                    except Exception:
+                        pass
+
+                time.sleep(1)  # small sleep between rule loops, then back to long-poll
+
+            except Exception:
+                logger.exception("WeChatUOS TG_fwd: poll loop error, sleeping 30s")
+                time.sleep(30)
 
 
 def check_requirements() -> bool:
@@ -794,4 +1979,181 @@ def register(ctx) -> None:
             "普通微信不渲染完整 Markdown，优先用纯文本。"
         ),
     )
+
+
+# ── TG Channel → WeChat forwarder (runs inside adapter, shares itchat) ──
+
+TG_FWD_DIR = HERMES_HOME / "data" / "tg_fwd"
+TG_FWD_CONFIG = TG_FWD_DIR / "config.json"
+TG_FWD_CACHE = TG_FWD_DIR / "media_cache"
+MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024  # 3 GB self-preservation
+
+
+def _tg_api_call(token: str, method: str, params: dict = None, timeout: int = 30) -> dict:
+    """Call Telegram Bot API with retry. Returns parsed JSON."""
+    qs = _urlencode(params) if params else ""
+    url = f"https://api.telegram.org/bot{token}/{method}?{qs}" if qs else f"https://api.telegram.org/bot{token}/{method}"
+    max_attempts = 3
+    for attempt in range(1, max_attempts + 1):
+        try:
+            req = _URLRequest(url)
+            with _urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode())
+        except Exception as e:
+            msg = str(e)
+            is_tls = "TLS" in msg or "SSL" in msg or "EOF" in msg or "Connection aborted" in msg or "Remote end closed" in msg
+            if is_tls:
+                logger.debug("TG_fwd API %s TLS error (attempt %d/%d): %s", method, attempt, max_attempts, msg)
+            elif "timed out" not in msg:
+                logger.warning("TG_fwd API %s exception (attempt %d/%d): %s", method, attempt, max_attempts, msg)
+            if attempt < max_attempts:
+                time.sleep(2 * attempt)
+            else:
+                return {"ok": False, "description": msg}
+    return {"ok": False, "description": "max attempts reached"}
+
+
+def _tg_biggest_photo(sizes: list) -> dict:
+    return max(sizes, key=lambda x: x.get("file_size", 0) or 0) if sizes else {}
+
+
+def _tg_resolve_file(msg: dict) -> tuple:
+    """Return (file_id, ext) or (None, None)."""
+    if "photo" in msg:
+        p = _tg_biggest_photo(msg["photo"])
+        return p.get("file_id"), "jpg"
+    if "video" in msg:
+        return msg["video"].get("file_id"), "mp4"
+    if "document" in msg:
+        d = msg["document"]
+        fn = d.get("file_name", "")
+        return d.get("file_id"), Path(fn).suffix.lstrip(".") or "bin"
+    if "audio" in msg:
+        a = msg["audio"]
+        fn = a.get("file_name", a.get("title", "audio"))
+        return a.get("file_id"), Path(fn).suffix.lstrip(".") or "mp3"
+    if "animation" in msg:
+        return msg["animation"].get("file_id"), "mp4"
+    if "voice" in msg:
+        return msg["voice"].get("file_id"), "ogg"
+    return None, None
+
+
+def _tg_format(msg: dict) -> str:
+    """Format a TG channel post text for WeChat delivery."""
+    text = msg.get("text") or msg.get("caption") or ""
+    lines = [l.strip() for l in text.split("\n")]
+    text = "\n".join(l for l in lines if l)
+    prefix = ""
+    if "photo" in msg:
+        prefix = "📷"
+    elif "video" in msg:
+        prefix = "🎬"
+    elif "document" in msg:
+        d = msg["document"]
+        prefix = f"📄 {d.get('file_name', '')}" if d.get("file_name") else "📄"
+    elif "audio" in msg:
+        prefix = "🎵"
+    elif "animation" in msg:
+        prefix = "🎞️"
+    elif "voice" in msg:
+        prefix = "🎤"
+    out = prefix
+    if text:
+        out = f"{prefix}\n{text}" if prefix else text
+    for ent in msg.get("entities", []):
+        if ent.get("type") == "text_link" and ent.get("url"):
+            out += f"\n🔗 {ent['url']}"
+    return out[:MAX_MESSAGE_LENGTH].strip() if len(out) > MAX_MESSAGE_LENGTH else out.strip()
+
+
+def _tg_orig_filename(msg: dict, msg_id: int, ext: str) -> str:
+    """Try to recover the original filename from a TG message."""
+    if "document" in msg:
+        fn = msg["document"].get("file_name", "")
+        if fn:
+            return fn
+    if "video" in msg:
+        fn = msg["video"].get("file_name", "")
+        if fn:
+            return fn
+    if "audio" in msg:
+        fn = msg["audio"].get("file_name", "")
+        if fn:
+            return fn
+    if "animation" in msg:
+        fn = msg["animation"].get("file_name", "")
+        if fn:
+            return fn
+    if "photo" in msg:
+        return f"photo_{msg_id}.{ext}"
+    if "voice" in msg:
+        return f"voice_{msg_id}.{ext}"
+    return f"file_{msg_id}.{ext}"
+
+
+def _tg_download_media(token: str, msg: dict, msg_id: int, cache_dir: Path) -> Optional[Path]:
+    """Download a media file from Telegram. Returns local path or None."""
+    file_id, ext = _tg_resolve_file(msg)
+    if not file_id:
+        return None
+    result = _tg_api_call(token, "getFile", {"file_id": file_id})
+    if not result.get("ok"):
+        return None
+    tg_path = result["result"].get("file_path", "")
+    if not tg_path:
+        return None
+    fname = _tg_orig_filename(msg, msg_id, ext)
+    local_path = cache_dir / fname
+    if local_path.exists():
+        return local_path
+    # Download
+    dl_url = f"https://api.telegram.org/file/bot{token}/{tg_path}"
+    for attempt in range(1, 4):
+        try:
+            req = _URLRequest(dl_url)
+            with _urlopen(req, timeout=60) as resp:
+                local_path.write_bytes(resp.read())
+            return local_path
+        except Exception as e:
+            msg = str(e)
+            is_tls = "TLS" in msg or "SSL" in msg or "EOF" in msg or "Connection aborted" in msg or "Remote end closed" in msg
+            if is_tls:
+                logger.debug("TG_fwd media download TLS error (attempt %d/3): %s", attempt, msg)
+            else:
+                logger.warning("TG_fwd media download error (attempt %d/3): %s", attempt, msg)
+            if attempt < 3:
+                time.sleep(2 * attempt)
+            else:
+                return None
+    return None
+
+
+def _tg_fwd_load_state(tg_channel: str) -> dict:
+    sf = TG_FWD_DIR / f"{tg_channel.replace('@', '')}.json"
+    if sf.exists():
+        try:
+            return json.loads(sf.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _tg_fwd_save_state(tg_channel: str, state: dict) -> None:
+    sf = TG_FWD_DIR / f"{tg_channel.replace('@', '')}.json"
+    sf.write_text(json.dumps(state, ensure_ascii=False, indent=2))
+
+
+def _tg_fwd_load_gstate() -> dict:
+    gs = TG_FWD_DIR / "group_state.json"
+    if gs.exists():
+        try:
+            return json.loads(gs.read_text())
+        except Exception:
+            pass
+    return {}
+
+
+def _tg_fwd_is_enabled(group_id: str) -> bool:
+    return _tg_fwd_load_gstate().get(group_id, {}).get("enabled", True)
 
