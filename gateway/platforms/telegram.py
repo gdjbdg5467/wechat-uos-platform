@@ -5,6 +5,11 @@ Uses python-telegram-bot library for:
 - Receiving messages from users/groups
 - Sending responses back
 - Handling media and commands
+
+Also provides a channel_post forwarding registry so platform plugins
+(such as WeChat UOS) can receive channel posts without their own
+getUpdates polling — avoiding the "409 Conflict" that occurs when
+two connections use the same bot token.
 """
 
 import asyncio
@@ -14,7 +19,34 @@ import os
 import tempfile
 import html as _html
 import re
-from typing import Dict, List, Optional, Any
+from typing import Callable, Coroutine, Dict, List, Optional, Any
+
+logger = logging.getLogger(__name__)
+
+# ── Channel post forwarding registry ──────────────────────────────────────
+# Platform plugins (e.g. WeChat UOS TG_fwd) register callbacks here instead
+# of starting their own getUpdates polling, which would conflict with the
+# gateway's polling connection.  Callbacks receive the PTB Message object
+# from update.channel_post.
+_channel_post_forwarders: Dict[str, Callable] = {}
+"""name -> async def(message: Message) -> None"""
+
+def register_channel_post_forwarder(name: str, callback: Callable) -> None:
+    """Register a channel post forwarder.
+
+    ``callback`` is an async callable that receives the PTB Message object
+    from ``update.channel_post``.  Multiple forwarders may be registered;
+    each is called in registration order.  Errors are logged but never
+    propagate.
+    """
+    _channel_post_forwarders[name] = callback
+    logger.info("[telegram] channel_post forwarder '%s' registered", name)
+
+
+def unregister_channel_post_forwarder(name: str) -> None:
+    """Remove a previously registered channel post forwarder."""
+    _channel_post_forwarders.pop(name, None)
+    logger.info("[telegram] channel_post forwarder '%s' unregistered", name)
 
 logger = logging.getLogger(__name__)
 
@@ -4579,6 +4611,26 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         return getattr(update, "effective_message", None) or getattr(update, "message", None)
 
+    async def _dispatch_channel_post(self, channel_post: Message) -> None:
+        """Dispatch a channel post to all registered external forwarders.
+
+        Called from ``_handle_text_message`` and ``_handle_media_message``
+        when ``update.channel_post`` is present.  Each forwarder is called
+        with the PTB ``Message`` object.  Errors are logged but never
+        propagate — one failing forwarder does not prevent others from
+        running.
+        """
+        for name in sorted(_channel_post_forwarders.keys()):
+            cb = _channel_post_forwarders[name]
+            try:
+                result = cb(channel_post)
+                if hasattr(result, "__await__"):
+                    await result
+            except Exception:
+                logger.exception(
+                    "[%s] channel_post forwarder '%s' failed", self.name, name
+                )
+
     async def _handle_text_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming text messages.
 
@@ -4589,6 +4641,12 @@ class TelegramAdapter(BasePlatformAdapter):
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
+
+        # ── Channel post forwarding (instead of separate getUpdates polling) ──
+        if update.channel_post and _channel_post_forwarders:
+            await self._dispatch_channel_post(update.channel_post)
+            return
+
         if not self._should_process_message(msg):
             return
         await self._ensure_forum_commands(update.message)
@@ -4785,12 +4843,19 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
-        if not update.message:
+        if not update.message and not update.channel_post:
             return
-        if not self._should_process_message(update.message):
+
+        # ── Channel post forwarding ──
+        if update.channel_post and _channel_post_forwarders:
+            await self._dispatch_channel_post(update.channel_post)
             return
-        
+
         msg = update.message
+        if not msg:
+            return
+        if not self._should_process_message(msg):
+            return
         
         # Determine media type
         if msg.sticker:

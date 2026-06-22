@@ -27,6 +27,28 @@ from urllib.request import urlopen as _urlopen, Request as _URLRequest
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import BasePlatformAdapter, MessageEvent, MessageType, SendResult
 
+
+def _to_short_url(url: str) -> str:
+    """Convert long WeChat article URL to short format (mp_id_idx).
+    
+    Long: http://mp.weixin.qq.com/s?__biz=...&mid=2247485803&idx=2&sn=...
+    Short: https://mp.weixin.qq.com/s/2247485803_2
+    """
+    if not url or "?__biz=" not in url:
+        return url
+    try:
+        from urllib.parse import urlparse, parse_qs
+        parsed = urlparse(url)
+        params = parse_qs(parsed.query)
+        mid = params.get('mid', [''])[0]
+        idx = params.get('idx', [''])[0]
+        if mid and idx:
+            return f"https://mp.weixin.qq.com/s/{mid}_{idx}"
+    except Exception:
+        pass
+    return url
+
+
 logger = logging.getLogger(__name__)
 
 SUPER_ADMIN_NAMES = {"夢魚", "庾梦"}  # only these nicknames can be admin across all groups
@@ -255,6 +277,97 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         except Exception:
             logger.info("WeChatUOS: login successful at %.0f", self._login_ts)
 
+    # ─────────────────────────────────────────────────────────────────────
+    #  登录后自维护：自动迁移 home channel GID + 修复 bot token
+    # ─────────────────────────────────────────────────────────────────────
+    def _post_login_maintenance(self) -> None:
+        """After login, auto-fix home channel GID and TG_FWD bot token.
+
+        - WECHAT_UOS_HOME_CHANNEL in config.yaml gets stale when itchat-uos
+          reconnects with new group IDs.  Find the current '机器人测试' group
+          and update it.
+        - The tg_fwd bot token can be corrupted to '***' by tool redaction.
+          Restore from a safe backup file on every login.
+        """
+        try:
+            self._migrate_home_channel_gid()
+        except Exception:
+            logger.exception("WeChatUOS: home channel migration failed")
+        try:
+            self._fix_tg_fwd_token()
+        except Exception:
+            logger.exception("WeChatUOS: tg_fwd token fix failed")
+
+    def _migrate_home_channel_gid(self) -> None:
+        """Find the current '机器人测试' group GID and update home channel."""
+        if not self._itchat:
+            return
+        try:
+            # Get all current chatrooms
+            from pathlib import Path
+            import pickle
+            if not PKL_FILE.exists():
+                return
+            data = pickle.loads(PKL_FILE.read_bytes())
+            rooms = data.get("storage", {}).get("chatroomList", [])
+            target_name = None
+            new_gid = None
+            # Find the first non-empty-name group (usually 机器人测试)
+            for room in rooms:
+                gid = room.get("UserName", "")
+                name = room.get("NickName", "") or room.get("DisplayName", "") or ""
+                if name.strip() and gid:
+                    target_name = name
+                    new_gid = gid
+                    break
+            if not new_gid:
+                logger.warning("WeChatUOS: no chatrooms found for home channel migration")
+                return
+            old_gid = self.home_channel
+            if new_gid == old_gid:
+                return  # already up to date
+            # Update in-memory
+            self.home_channel = new_gid
+            logger.info("WeChatUOS: home channel migrated %s (%s) -> %s (%s)",
+                        old_gid[:16], target_name, new_gid[:16], target_name)
+            # Persist to config.yaml
+            self._update_config_key("WECHAT_UOS_HOME_CHANNEL", new_gid)
+        except Exception:
+            logger.exception("WeChatUOS: home channel GID migration failed")
+
+    def _fix_tg_fwd_token(self) -> None:
+        """Restore tg_fwd bot token from safe backup if corrupted."""
+        import json
+        bup = TG_FWD_TOKEN_BACKUP
+        cfg = TG_FWD_CONFIG
+        if not cfg.exists():
+            return
+        raw = cfg.read_bytes()
+        # Check if token is corrupted (has literal *** or too short)
+        try:
+            cfg_data = json.loads(raw)
+        except Exception:
+            return
+        token = cfg_data.get("bot_token", "")
+        if not token:
+            return
+        # Valid Telegram bot token is ~45 chars like 8951409744:ABC...
+        if "***" not in token and len(token) > 20:
+            # Token looks valid; make sure backup exists
+            if not bup.exists() or bup.read_text().strip() != token:
+                bup.write_text(token)
+                logger.info("WeChatUOS: backed up tg_fwd bot token")
+            return
+        # Token is corrupted — restore from backup
+        if bup.exists():
+            good = bup.read_text().strip()
+            if good and "***" not in good and len(good) > 20:
+                cfg_data["bot_token"] = good
+                cfg.write_text(json.dumps(cfg_data, ensure_ascii=False, indent=2))
+                logger.info("WeChatUOS: restored tg_fwd bot token from backup")
+                return
+        logger.warning("WeChatUOS: tg_fwd bot token is corrupted and no valid backup found")
+
     def _run_itchat(self) -> None:
         try:
             import itchat
@@ -288,12 +401,10 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 if self._handle_pansou_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
                 # ── TG forward toggle ──
-                tg_fwd_compact = text.strip().lower().replace(" ", "")
-                if self._handle_tg_fwd_toggle_command(tg_fwd_compact, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                if self._handle_tg_fwd_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
                 # ── CFTC toggle/upload commands ──
-                cftc_compact = text.strip().lower().replace(" ", "")
-                if self._handle_cftc_toggle_command(cftc_compact, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                if self._handle_cftc_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
                 if self._handle_cftc_upload_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
@@ -333,6 +444,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 loginCallback=self._login_callback,
                 exitCallback=lambda: logger.warning("WeChatUOS: logged out/disconnected"),
             )
+            # ── 登录后维护：自动修复 home channel GID 和 bot token ──
+            self._post_login_maintenance()
             logger.info("WeChatUOS: listening for group @mentions")
             self._start_tg_fwd()
             # ── Start LSPosed module tracker polling ──
@@ -473,6 +586,24 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._save_acl()
         return group
 
+    @staticmethod
+    def _update_config_key(key: str, value: str) -> None:
+        """Update a top-level key in ~/.hermes/config.yaml and persist."""
+        import re
+        cfg_path = HERMES_HOME / "config.yaml"
+        if not cfg_path.exists():
+            return
+        raw = cfg_path.read_text()
+        # Match existing key:value line (case-insensitive)
+        pattern = re.compile(r"^(?P<indent>\s*)" + re.escape(key) + r"\s*:\s*['\"]?(.*?)['\"]?\s*$", re.MULTILINE)
+        new_line = f"{key}: '{value}'"
+        if pattern.search(raw):
+            raw = pattern.sub(new_line, raw)
+        else:
+            raw = raw.rstrip() + "\n" + new_line + "\n"
+        cfg_path.write_text(raw)
+        logger.info("WeChatUOS: persisted %s = %s...", key, value[:16])
+
     def _group_in_allowlist(self, group_id: str, group_name: str) -> bool:
         if self.allowed_groups and group_id not in self.allowed_groups and group_name not in self.allowed_groups:
             logger.debug("WeChatUOS: ignored group %s/%s not in allowlist", group_name, group_id)
@@ -608,12 +739,24 @@ class WeChatUOSAdapter(BasePlatformAdapter):
     def _is_group_authorize_command(self, text: str) -> bool:
         s = (text or "").strip().lower()
         compact = s.replace(" ", "")
-        return compact in {"授权此群聊", "授权本群", "启用本群", "开启本群", "开启授权", "authorizegroup", "/authorizegroup"}
+        if compact in {"授权此群聊", "授权本群", "启用本群", "开启本群", "开启授权", "authorizegroup", "/authorizegroup"}:
+            return True
+        # Also check if command appears as second word (bot name prefix stripped imperfectly)
+        parts = s.split()
+        if len(parts) >= 2 and parts[1] in {"授权此群聊", "授权本群", "启用本群", "开启本群", "开启授权"}:
+            return True
+        return False
 
     def _is_group_deauthorize_command(self, text: str) -> bool:
         s = (text or "").strip().lower()
         compact = s.replace(" ", "")
-        return compact in {"关闭授权", "关闭本群", "禁用本群", "deauthorizegroup", "/deauthorizegroup"}
+        if compact in {"关闭授权", "关闭本群", "禁用本群", "deauthorizegroup", "/deauthorizegroup"}:
+            return True
+        # Also check if command appears as second word (bot name prefix stripped imperfectly)
+        parts = s.split()
+        if len(parts) >= 2 and parts[1] in {"关闭授权", "关闭本群", "禁用本群"}:
+            return True
+        return False
 
     def _can_use_group(self, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         with self._acl_lock:
@@ -695,13 +838,27 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     group["authorized"] = True
                     group["initial_admin_uid"] = sender_id
                     group["updated_at"] = int(time.time())
+                    # Auto-enable LSPosed push if this group is in lsposed_tracker target_groups
+                    try:
+                        _lsp_cfg_path = HERMES_HOME / "data" / "lsposed_tracker" / "config.json"
+                        if _lsp_cfg_path.exists():
+                            _lsp_cfg = json.loads(_lsp_cfg_path.read_text())
+                            _lsp_targets = _lsp_cfg.get("target_groups", []) or []
+                            if chat_id in _lsp_targets and not group.get("lsposed_enabled"):
+                                group["lsposed_enabled"] = True
+                                logger.info("WeChatUOS ACL: auto-enabled LSPosed push for %s (in target_groups)", group_name)
+                    except Exception:
+                        logger.debug("WeChatUOS ACL: auto-enable lsposed check failed", exc_info=True)
                     self._save_acl()
                     logger.info("WeChatUOS ACL: group authorized group=%s super_admin=%s uid=%s", group_name, sender, sender_id)
                     try:
                         self._refresh_group_members(chat_id, group_name)
                     except Exception:
                         logger.debug("WeChatUOS ACL: member refresh after authorization failed", exc_info=True)
-                    self._itchat.send("本群已授权成功。", toUserName=chat_id)
+                    if group.get("lsposed_enabled"):
+                        self._itchat.send("本群已授权成功。\n模块更新推送已自动开启（白名单群）。", toUserName=chat_id)
+                    else:
+                        self._itchat.send("本群已授权成功。", toUserName=chat_id)
                     # 自动加入 TG 转发列表
                     try:
                         self._auto_add_tg_fwd_group(chat_id, group_name)
@@ -755,15 +912,36 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 "取消管理员", "移除管理员", "取消授权", "移除权限",
                 "添加管理员", "设管理员", "添加权限", "加权限", "删权限", "管理员", "授权",
             ]
+            # Try to match cmd against known prefixes
+            matched = False
             for prefix in chinese_prefixes:
                 if cmd.startswith(prefix) and cmd != prefix:
                     target = cmd[len(prefix):].strip()
                     if target:
                         cmd = prefix
                         parts = [prefix, target]
-                        break
-            else:
-                return False
+                        matched = True
+                    break
+            if not matched:
+                # cmd didn't match any prefix; check if the next word is the command
+                if len(parts) >= 2:
+                    candidate = parts[1].lower()
+                    if candidate in aliases:
+                        cmd = candidate
+                        parts = [cmd] + parts[2:]
+                    else:
+                        for prefix in chinese_prefixes:
+                            if candidate.startswith(prefix) and candidate != prefix:
+                                target = candidate[len(prefix):].strip()
+                                if target:
+                                    cmd = prefix
+                                    parts = [prefix, target]
+                                matched = True
+                                break
+                        if not matched:
+                            return False
+                else:
+                    return False
         with self._acl_lock:
             group = self._group_acl(chat_id, group_name)
             authorized = bool(group.get("authorized"))
@@ -831,12 +1009,25 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         if not text:
             return None
         s = text.strip()
+        # Helper: extract keyword after a command word (搜索 or 搜)
+        def _kw_after(s: str, cmd_len: int) -> str:
+            rest = s[cmd_len:].strip()
+            return rest if rest else ""
+        # First word check (normal case)
         if s.startswith("搜索"):
-            kw = s[2:].strip()
-            return kw if kw else None
+            return _kw_after(s, 2)
         if s.startswith("搜 ") or s.startswith("搜"):
-            kw = s[2:].strip() if len(s) > 2 else ""
-            return kw if kw else None
+            return _kw_after(s, 2)
+        # Second word fallback (bot name prefix stripped imperfectly)
+        parts = s.split()
+        if len(parts) >= 2:
+            # If second word is exactly a command, keyword is the rest
+            if parts[1] == "搜索" or parts[1] == "搜":
+                return " ".join(parts[2:]).strip()
+            # If second word starts with command, treat as combined (e.g., 搜索关键词)
+            if parts[1].startswith("搜索") or parts[1].startswith("搜"):
+                kw = parts[1][2:].strip()
+                return kw if kw else None
         return None
 
     def _pansou_is_enabled(self, group_id: str) -> bool:
@@ -927,9 +1118,17 @@ class WeChatUOSAdapter(BasePlatformAdapter):
     def _handle_pansou_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         """Handle 开启盘搜 / 关闭盘搜 commands. Returns True if consumed."""
         s = (text or "").strip().lower()
+        # Exact match after removing all spaces
         compact = s.replace(" ", "")
-        if compact not in ("开启盘搜", "关闭盘搜"):
-            return False
+        if compact in ("开启盘搜", "关闭盘搜"):
+            cmd = compact
+        else:
+            # Check if command is second word (bot name prefix stripped imperfectly)
+            parts = s.split()
+            if len(parts) >= 2 and parts[1] in ("开启盘搜", "关闭盘搜"):
+                cmd = parts[1]
+            else:
+                return False
         if self._itchat is None:
             return True
         with self._acl_lock:
@@ -941,7 +1140,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             if not self._is_group_admin(group, sender, sender_id):
                 self._itchat.send("你没有权限管理盘搜。", toUserName=group_id)
                 return True
-            is_enable = compact == "开启盘搜"
+            is_enable = cmd == "开启盘搜"
             group["pansou_enabled"] = is_enable
             group["updated_at"] = int(time.time())
             self._save_acl()
@@ -950,10 +1149,20 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         logger.info("WeChatUOS PanSou: %s for %s by %s/%s", "enabled" if is_enable else "disabled", group_name, sender, sender_id)
         return True
 
-    def _handle_tg_fwd_toggle_command(self, compact: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+    def _handle_tg_fwd_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         """Handle 开启转发 / 关闭转发 commands. Returns True if consumed."""
-        if compact not in ("开启转发", "关闭转发", "开启tg转发", "关闭tg转发"):
-            return False
+        s = (text or "").strip().lower()
+        # Exact match after removing all spaces
+        compact = s.replace(" ", "")
+        if compact in ("开启转发", "关闭转发", "开启tg转发", "关闭tg转发"):
+            cmd = compact
+        else:
+            # Check if command is second word (bot name prefix stripped imperfectly)
+            parts = s.split()
+            if len(parts) >= 2 and parts[1] in ("开启转发", "关闭转发", "开启tg转发", "关闭tg转发"):
+                cmd = parts[1]
+            else:
+                return False
         if self._itchat is None:
             return True
         with self._acl_lock:
@@ -965,7 +1174,26 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             if not self._is_group_admin(group, sender, sender_id):
                 self._itchat.send("你没有权限管理 TG 转发。", toUserName=group_id)
                 return True
-        is_enable = compact in ("开启转发", "开启tg转发")
+        is_enable = cmd in ("开启转发", "开启tg转发")
+        # Also update config.json forward_rules — add group when enabling, remove when disabling
+        try:
+            if TG_FWD_CONFIG.exists():
+                cfg = json.loads(TG_FWD_CONFIG.read_text())
+                changed = False
+                for rule in cfg.get("forward_rules", []):
+                    wx_groups = rule.get("wechat_groups", [])
+                    if is_enable:
+                        if group_id not in wx_groups:
+                            wx_groups.append(group_id)
+                            changed = True
+                    else:
+                        if group_id in wx_groups:
+                            wx_groups.remove(group_id)
+                            changed = True
+                if changed:
+                    TG_FWD_CONFIG.write_text(json.dumps(cfg, ensure_ascii=False, indent=2))
+        except Exception:
+            logger.debug("WeChatUOS TG_fwd: config update failed", exc_info=True)
         gs_path = TG_FWD_DIR / "group_state.json"
         gstate = {}
         if gs_path.exists():
@@ -1191,10 +1419,20 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             logger.exception("CFTC: upload error")
             return ""
 
-    def _handle_cftc_toggle_command(self, compact: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
-        compact = compact.strip()
-        if compact not in {"开启上传", "关闭上传"}:
-            return False
+    def _handle_cftc_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        """Handle 开启上传 / 关闭上传 commands. Returns True if consumed."""
+        s = (text or "").strip().lower()
+        # Exact match after removing all spaces
+        compact = s.replace(" ", "")
+        if compact in {"开启上传", "关闭上传"}:
+            cmd = compact
+        else:
+            # Check if command is second word (bot name prefix stripped imperfectly)
+            parts = s.split()
+            if len(parts) >= 2 and parts[1] in {"开启上传", "关闭上传"}:
+                cmd = parts[1]
+            else:
+                return False
         if self._itchat is None: return True
         with self._acl_lock:
             group = self._group_acl(group_id, group_name)
@@ -1203,7 +1441,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 self._itchat.send("当前群尚未授权。请发送：@机器人 开启授权 或 授权此群聊", toUserName=group_id); return True
             if not self._is_group_admin(group, sender, sender_id):
                 self._itchat.send("你没有权限管理本群机器人。", toUserName=group_id); return True
-            enabled = compact == "开启上传"
+            enabled = cmd == "开启上传"
             group["cftc_enabled"] = enabled; group["updated_at"] = int(time.time()); self._save_acl()
         self._itchat.send(f"✅ 图床上传已{'开启' if enabled else '关闭'}", toUserName=group_id)
         logger.info("CFTC: %s for group %s by %s/%s", "enabled" if enabled else "disabled", group_name, sender, sender_id)
@@ -1211,27 +1449,35 @@ class WeChatUOSAdapter(BasePlatformAdapter):
 
     def _handle_cftc_upload_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         s = text.strip().lower().replace(" ", "")
+        # Check exact match or second word (bot name prefix stripped imperfectly)
         if s == "上传" or s.startswith("上传"):
-            if self._itchat is None: return True
-            with self._acl_lock:
-                group = self._group_acl(group_id, group_name)
-                if not group.get("authorized"):
-                    self._itchat.send("当前群尚未授权。请发送：@机器人 开启授权 或 授权此群聊", toUserName=group_id); return True
-                if not group.get("cftc_enabled", True):
-                    self._itchat.send("本群图床上传已关闭。", toUserName=group_id); return True
-                if not self._can_use_group(group_id, group_name, sender, sender_id): return True
-            parts = text.strip().split()
-            storage_type = parts[-1].strip().lower() if len(parts) >= 2 and parts[-1].strip().lower() in ("telegram", "r2") else "telegram"
-            media = self._cftc_find_latest(group_id)
-            if not media:
-                self._itchat.send("没有找到可上传的媒体文件。请先发送图片/文件到群聊。", toUserName=group_id); return True
-            fp = media["path"]
-            if not fp.exists():
-                self._itchat.send("媒体文件已过期，请重新发送。", toUserName=group_id); return True
-            self._itchat.send(f"⏫ 正在上传 {media['name']} 到 CFTC...", toUserName=group_id)
-            url = self._cftc_upload_file(fp, media["name"], storage_type)
-            self._itchat.send(f"✅ 上传成功：{url}" if url else "上传失败，请重试。", toUserName=group_id)
-            return True
+            cmd_word = "上传"
+        else:
+            parts = text.strip().lower().split()
+            if len(parts) >= 2 and parts[1] == "上传":
+                cmd_word = "上传"
+            else:
+                return False
+        if self._itchat is None: return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            if not group.get("authorized"):
+                self._itchat.send("当前群尚未授权。请发送：@机器人 开启授权 或 授权此群聊", toUserName=group_id); return True
+            if not group.get("cftc_enabled", True):
+                self._itchat.send("本群图床上传已关闭。", toUserName=group_id); return True
+            if not self._can_use_group(group_id, group_name, sender, sender_id): return True
+        parts = text.strip().split()
+        storage_type = parts[-1].strip().lower() if len(parts) >= 2 and parts[-1].strip().lower() in ("telegram", "r2") else "telegram"
+        media = self._cftc_find_latest(group_id)
+        if not media:
+            self._itchat.send("没有找到可上传的媒体文件。请先发送图片/文件到群聊。", toUserName=group_id); return True
+        fp = media["path"]
+        if not fp.exists():
+            self._itchat.send("媒体文件已过期，请重新发送。", toUserName=group_id); return True
+        self._itchat.send(f"⏫ 正在上传 {media['name']} 到 CFTC...", toUserName=group_id)
+        url = self._cftc_upload_file(fp, media["name"], storage_type)
+        self._itchat.send(f"✅ 上传成功：{url}" if url else "上传失败，请重试。", toUserName=group_id)
+        return True
         return False
 
     # ═══════════════════════════════════════════════════════════════════════
@@ -1249,12 +1495,14 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         logger.info("WeChatUOS LSPosed: poll loop started")
         first_run = True
         while not self._lsposed_stop.is_set():
+            cfg = None
             try:
                 cfg = self._lsposed_load_config()
                 if cfg.get("enabled", False): self._lsposed_run_once(cfg, first_run)
                 first_run = False
             except Exception: logger.exception("WeChatUOS LSPosed: poll error")
-            for _ in range(1800 // 5):
+            interval = (cfg or {}).get("interval_seconds", 1800)
+            for _ in range(interval // 5):
                 if self._lsposed_stop.is_set(): return
                 time.sleep(5)
 
@@ -1289,9 +1537,12 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 if len(updates) >= max_up: break
                 mname = mod.get("name", "") or mod.get("moduleName", "")
                 if not mname: continue
-                ver = mod.get("version", "") or mod.get("versionName", "") or "0"
+                # Extract version from latestRelease.tagName (GitHub GraphQL structure)
+                lr = mod.get("latestRelease") or {}
+                ver = lr.get("tagName", "") or mod.get("version", "") or mod.get("versionName", "") or ""
+                desc = mod.get("description", "")
                 old_ver = state.get("modules", {}).get(mname, "")
-                if ver and ver != old_ver: updates.append({"type": "module", "name": mname, "version": ver, "old_version": old_ver, "mod": mod})
+                if ver and ver != old_ver: updates.append({"type": "module", "name": mname, "description": desc, "version": ver, "old_version": old_ver, "mod": mod})
             state.setdefault("modules", {}).update({u["name"]: u["version"] for u in updates})
         import urllib.request
         for repo in cfg.get("custom_repos", []):
@@ -1308,6 +1559,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     updates.append({"type": "custom", "name": label, "version": tag, "old_version": old_tag, "url": asset.get("browser_download_url", ""), "body": (release.get("body") or "")[:500]})
                 state.setdefault("custom_repos", {})[f"{owner}/{repo_name}"] = tag
             except Exception: logger.debug("LSPosed: GitHub fetch failed for %s/%s", owner, repo_name)
+        state["last_polled_at"] = int(time.time())
         self._lsposed_save_state(state)
         if first_run:
             logger.info("LSPosed: baseline %d modules, %d custom repos", len(state.get("modules", {})), len(state.get("custom_repos", {})))
@@ -1460,26 +1712,55 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         return results
 
     def _lsposed_format_update(self, up: dict) -> str:
-        t = up.get("type", "unknown"); name = up.get("name", "?"); ver = up.get("version", "?"); old_ver = up.get("old_version", "")
-        lines = [f"📦 {name}", f"版本：{ver}"]
-        if old_ver: lines.append(f"旧版本：{old_ver}")
+        t = up.get("type", "unknown")
+        name = up.get("name", "?")
+        desc = up.get("description", "")
+        ver = up.get("version", "?")
+        old_ver = up.get("old_version", "")
+        # 第一行：名称 + 描述（如描述存在）
+        if desc:
+            line1 = f"📦 {name} - {desc}"
+        else:
+            line1 = f"📦 {name}"
+        lines = [line1, f"版本：{ver}"]
+        if old_ver:
+            lines.append(f"旧版本：{old_ver}")
+        # 下载链接：module 和 custom 类型都支持
+        dl_url = ""
         if t == "custom":
-            dl_url = up.get("url", ""); body = up.get("body", "")
-            if dl_url: lines.append(f"下载：{dl_url}")
-            if body: lines.append(f"说明：{body[:200]}")
+            dl_url = up.get("url", "")
+        elif t == "module":
+            mod = up.get("mod", {})
+            lr = mod.get("latestRelease") or {}
+            assets = lr.get("releaseAssets", {}).get("nodes", [])
+            if assets:
+                dl_url = assets[0].get("downloadUrl", "")
+        if dl_url:
+            lines.append(f"链接：{dl_url}")
+        if t == "custom":
+            body = up.get("body", "")
+            if body:
+                lines.append(f"说明：{body[:200]}")
         lines.append("")
-        return "\\n".join(lines)
+        return "\n".join(lines)
 
     def _handle_lsposed_text_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         s = text.strip().lower().replace(" ", "")
-        if s not in {"开启更新", "关闭更新", "模块更新状态"}: return False
+        if s in {"开启更新", "关闭更新", "模块更新状态"}:
+            cmd = s
+        else:
+            parts = text.strip().lower().split()
+            if len(parts) >= 2 and parts[1] in {"开启更新", "关闭更新", "模块更新状态"}:
+                cmd = parts[1]
+            else:
+                return False
         if self._itchat is None: return True
         with self._acl_lock:
             group = self._group_acl(group_id, group_name)
             self._remember_member(group, sender_id, nick=sender, display=sender)
             if not group.get("authorized"): self._itchat.send("当前群尚未授权。", toUserName=group_id); return True
             if not self._is_group_admin(group, sender, sender_id): self._itchat.send("你没有权限。", toUserName=group_id); return True
-        if s == "开启更新":
+        if cmd == "开启更新":
             with self._acl_lock:
                 group = self._group_acl(group_id, group_name)
                 group["lsposed_enabled"] = True
@@ -1488,7 +1769,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._itchat.send("✅ 模块更新已开启", toUserName=group_id)
             logger.info("LSPosed: enabled for %s by %s/%s", group_name, sender, sender_id)
             return True
-        if s == "关闭更新":
+        if cmd == "关闭更新":
             with self._acl_lock:
                 group = self._group_acl(group_id, group_name)
                 group["lsposed_enabled"] = False
@@ -1497,7 +1778,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._itchat.send("✅ 模块更新已关闭", toUserName=group_id)
             logger.info("LSPosed: disabled for %s by %s/%s", group_name, sender, sender_id)
             return True
-        if s == "模块更新状态":
+        if cmd == "模块更新状态":
             cfg = self._lsposed_load_config()
             state = self._lsposed_load_state()
             with self._acl_lock:
@@ -1509,14 +1790,23 @@ class WeChatUOSAdapter(BasePlatformAdapter):
 
     def _handle_werss_text_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         s = text.strip().lower().replace(" ", "")
-        if s not in {"开启推文", "关闭推文"}: return False
+        # Exact match after removing all spaces
+        if s in {"开启推文", "关闭推文"}:
+            cmd = s
+        else:
+            # Check if command is second word (bot name prefix stripped imperfectly)
+            parts = text.strip().lower().split()
+            if len(parts) >= 2 and parts[1] in {"开启推文", "关闭推文"}:
+                cmd = parts[1]
+            else:
+                return False
         if self._itchat is None: return True
         with self._acl_lock:
             group = self._group_acl(group_id, group_name)
             self._remember_member(group, sender_id, nick=sender, display=sender)
             if not group.get("authorized"): self._itchat.send("当前群尚未授权。", toUserName=group_id); return True
             if not self._is_group_admin(group, sender, sender_id): self._itchat.send("你没有权限。", toUserName=group_id); return True
-        if s == "开启推文":
+        if cmd == "开启推文":
             with self._acl_lock:
                 group = self._group_acl(group_id, group_name)
                 group["werss_enabled"] = True
@@ -1525,7 +1815,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._itchat.send("✅ 公众号推文推送已开启", toUserName=group_id)
             logger.info("WeRSS: enabled for %s by %s/%s", group_name, sender, sender_id)
             return True
-        if s == "关闭推文":
+        if cmd == "关闭推文":
             with self._acl_lock:
                 group = self._group_acl(group_id, group_name)
                 group["werss_enabled"] = False
@@ -1561,15 +1851,30 @@ class WeChatUOSAdapter(BasePlatformAdapter):
 
     def _werss_fetch_articles(self, token: str) -> List[Dict[str, Any]]:
         try:
-            data = _urlopen(
-                _URLRequest(
-                    f"{WERSS_BASE}/articles?offset=0&limit=20",
-                    headers={"Authorization": f"Bearer {token}"},
-                ),
-                timeout=15,
-            ).read()
-            resp = json.loads(data)
-            return resp.get("data", {}).get("list", [])
+            # Paginate to fetch all articles (WeRSS API max limit=100)
+            all_articles: List[Dict[str, Any]] = []
+            offset = 0
+            limit = 100
+            while True:
+                data = _urlopen(
+                    _URLRequest(
+                        f"{WERSS_BASE}/articles?offset={offset}&limit={limit}",
+                        headers={"Authorization": f"Bearer {token}"},
+                    ),
+                    timeout=15,
+                ).read()
+                resp = json.loads(data)
+                page = resp.get("data", {}).get("list", [])
+                all_articles.extend(page)
+                # Stop if we got fewer than 'limit' articles (last page)
+                if len(page) < limit:
+                    break
+                offset += limit
+                # Safety cap: stop after 5 pages (500 articles)
+                if offset >= 500:
+                    logger.warning("WeChatUOS WeRSS: fetched 500+ articles, stopping pagination")
+                    break
+            return all_articles
         except Exception:
             logger.exception("WeChatUOS WeRSS: fetch articles failed")
             return []
@@ -1584,13 +1889,20 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 last_creates = set(st.get("seen_ids", []))
             except Exception:
                 pass
+        logger.info("WeChatUOS WeRSS: seen_ids count=%d", len(last_creates))
         while not self._werss_stop.is_set():
             try:
+                logger.info("WeChatUOS WeRSS: poll iteration starting")
                 token = self._werss_login()
+                logger.info("WeChatUOS WeRSS: login result=%s", "OK" if token else "NONE")
                 if not token:
+                    logger.info("WeChatUOS WeRSS: login failed, sleeping 60s")
                     time.sleep(60)
                     continue
                 articles = self._werss_fetch_articles(token)
+                # Fix articles with status=1000 in WeRSS DB: set them to 1 (published)
+                # so Hermes API can fetch them and push to groups
+                self._werss_fix_deleted_status()
                 new_articles = [a for a in articles if a.get("id") not in last_creates]
                 if new_articles:
                     # Mark all fetched IDs as seen
@@ -1625,12 +1937,30 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._werss_stop.wait(WERSS_POLL_INTERVAL)
         logger.info("WeChatUOS WeRSS: poll loop stopped")
 
+    def _werss_fix_deleted_status(self) -> None:
+        """Fix WeRSS articles with status=1000 (deleted) → 1 (published) so API returns them."""
+        try:
+            import sqlite3
+            db_path = Path("/vol1/1000/docker/werss/data/we_mp_rss.db")
+            if not db_path.exists():
+                return
+            conn = sqlite3.connect(str(db_path))
+            cur = conn.cursor()
+            cur.execute("UPDATE articles SET status=1 WHERE status=1000")
+            updated = cur.rowcount
+            conn.commit()
+            conn.close()
+            if updated:
+                logger.info("WeChatUOS WeRSS: fixed %d deleted articles (status 1000→1)", updated)
+        except Exception:
+            logger.debug("WeChatUOS WeRSS: fix deleted status skipped", exc_info=True)
+
     def _werss_push_article(self, article: Dict[str, Any]) -> None:
         try:
             art_id = article.get("id", "")
             mp_name = article.get("mp_name", "未知公众号")
             title = article.get("title", "无标题")
-            url = article.get("url", "")
+            url = _to_short_url(article.get("url", ""))
             desc = article.get("description", "")
             # Format message
             msg = f"📰 {mp_name}\n{title}"
@@ -1648,6 +1978,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 try:
                     if self._itchat:
                         self._itchat.send(msg, toUserName=gid)
+                        logger.info("WeChatUOS WeRSS: pushed %s -> %s to %s", mp_name, title[:50], gid[:16])
                         time.sleep(0.5)  # rate limit
                 except Exception:
                     logger.exception("WeChatUOS WeRSS: push to %s failed", gid[:16])
@@ -1663,7 +1994,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             lines = [f"📰 {mp_name}"]
             for i, art in enumerate(articles, 1):
                 title = art.get("title", "无标题")
-                url = art.get("url", "")
+                url = _to_short_url(art.get("url", ""))
                 desc = art.get("description", "")
                 lines.append("")
                 lines.append(f"─── {i} ───")
@@ -1682,6 +2013,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 try:
                     if self._itchat:
                         self._itchat.send(msg, toUserName=gid)
+                        logger.info("WeChatUOS WeRSS: batch pushed %s (%d articles) to %s", mp_name, len(articles), gid[:16])
                         time.sleep(0.5)
                 except Exception:
                     logger.exception("WeChatUOS WeRSS: batch push to %s failed", gid[:16])
@@ -1986,6 +2318,7 @@ def register(ctx) -> None:
 TG_FWD_DIR = HERMES_HOME / "data" / "tg_fwd"
 TG_FWD_CONFIG = TG_FWD_DIR / "config.json"
 TG_FWD_CACHE = TG_FWD_DIR / "media_cache"
+TG_FWD_TOKEN_BACKUP = HERMES_HOME / ".tg_fwd_token"  # safe backup, not exposed to tools
 MAX_RSS_BYTES = 3 * 1024 * 1024 * 1024  # 3 GB self-preservation
 
 
