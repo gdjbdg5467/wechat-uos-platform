@@ -1675,7 +1675,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         if self._itchat is None:
             return True
         msg = (
-            "🤖 发哥机器人使用帮助\n\n"
+            "🤖 梦鱼机器人使用帮助\n\n"
             "📋 基本命令（@机器人 + 命令）\n\n"
             "🔐 授权管理（管理员）\n"
             "  开启授权 / 关闭授权\n"
