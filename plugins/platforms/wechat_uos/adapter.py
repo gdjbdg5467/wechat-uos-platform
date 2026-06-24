@@ -404,6 +404,9 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     return
                 if self._handle_acl_command(text, sender=sender, sender_id=sender_id, chat_id=group_id, group_name=group_name):
                     return
+                # ── 帮助 ──
+                if self._handle_help_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
                 # ── PanSou 盘搜 ──
                 pansou_result = self._handle_pansou_search(text, group_id, group_name, sender=sender, sender_id=sender_id)
                 if pansou_result is not None:
@@ -1656,6 +1659,49 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             lines.append(f"🔗 {video_url}")
             lines.append("⚠️ 视频直链可能被防刷，点开后复制链接到浏览器打开")
             self._itchat.send("\n".join(lines), toUserName=group_id)
+        return True
+
+    # ── 帮助 ────────────────────────────────────────────────────────────────
+
+    def _handle_help_command(self, text: str, *, group_id: str, group_name: str, sender: str = "", sender_id: str = "") -> bool:
+        """Handle 帮助 command. Shows feature list. Returns True if consumed."""
+        s = (text or "").strip().lower().replace(" ", "")
+        if s not in {"帮助", "help", "功能", "命令"}:
+            parts = s.split()
+            if len(parts) >= 2 and parts[1] in {"帮助", "help", "功能", "命令"}:
+                pass
+            else:
+                return False
+        if self._itchat is None:
+            return True
+        msg = (
+            "🤖 发哥机器人使用帮助\n\n"
+            "📋 基本命令（@机器人 + 命令）\n\n"
+            "🔐 授权管理（管理员）\n"
+            "  开启授权 / 关闭授权\n"
+            "  授权 昵称 / 取消授权 昵称\n"
+            "  设管理员 昵称 / 取消管理员 昵称\n"
+            "  权限列表 / 名单\n\n"
+            "🔍 盘搜\n"
+            "  搜索 <关键词>\n"
+            "  开启盘搜 / 关闭盘搜\n\n"
+            "🎵 抖音解析\n"
+            "  直接发送抖音/TikTok链接自动解析\n"
+            "  开启抖音解析 / 关闭抖音解析\n\n"
+            "📰 公众号推送\n"
+            "  订阅 公众号名 / 取消订阅 公众号名\n"
+            "  订阅列表 / 查看订阅\n"
+            "  开启推文 / 关闭推文\n\n"
+            "📤 TG转发\n"
+            "  开启转发 / 关闭转发\n\n"
+            "📎 图床上传\n"
+            "  开启上传 / 关闭上传\n"
+            "  上传\n\n"
+            "🔄 模块更新\n"
+            "  开启更新 / 关闭更新\n\n"
+            "💬 直接发消息与 AI 对话"
+        )
+        self._itchat.send(msg, toUserName=group_id)
         return True
 
     def _handle_cftc_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
