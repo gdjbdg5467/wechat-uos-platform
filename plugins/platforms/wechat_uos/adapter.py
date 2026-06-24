@@ -1665,10 +1665,11 @@ class WeChatUOSAdapter(BasePlatformAdapter):
 
     def _handle_help_command(self, text: str, *, group_id: str, group_name: str, sender: str = "", sender_id: str = "") -> bool:
         """Handle 帮助 command. Shows feature list. Returns True if consumed."""
-        s = (text or "").strip().lower().replace(" ", "")
+        raw = (text or "").strip()
+        s = raw.lower().replace(" ", "")
         if s not in {"帮助", "help", "功能", "命令"}:
-            parts = s.split()
-            if len(parts) >= 2 and parts[1] in {"帮助", "help", "功能", "命令"}:
+            parts = raw.split()
+            if len(parts) >= 2 and parts[1].lower().replace(" ", "") in {"帮助", "help", "功能", "命令"}:
                 pass
             else:
                 return False
