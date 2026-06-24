@@ -1847,8 +1847,11 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         state["last_polled_at"] = int(time.time())
         self._lsposed_save_state(state)
         if first_run:
-            logger.info("LSPosed: baseline %d modules, %d custom repos", len(state.get("modules", {})), len(state.get("custom_repos", {})))
-            return 0
+            has_history = bool(state.get("modules")) or bool(state.get("custom_repos"))
+            if not has_history:
+                logger.info("LSPosed: first-run baseline %d modules, %d custom repos", len(state.get("modules", {})), len(state.get("custom_repos", {})))
+                return 0
+            logger.info("LSPosed: first-run with history, %d updates detected", len(updates))
         if not updates: return 0
         groups = cfg.get("target_groups", [])
         # Load ACL once for permission checks
