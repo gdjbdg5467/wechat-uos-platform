@@ -14,6 +14,7 @@ import html
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.request
@@ -51,6 +52,14 @@ def _to_short_url(url: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+# ── TG channel_post forwarder registration ──────────────────────────────
+# Registered so the gateway pushes channel posts to us instead of us polling
+# getUpdates — avoids 409 Conflict from duplicate bot-token connections.
+try:
+    from gateway.platforms.telegram import register_channel_post_forwarder
+    TG_FWD_REGISTRY_AVAILABLE = True
+except Exception:
+    TG_FWD_REGISTRY_AVAILABLE = False
 SUPER_ADMIN_NAMES = {"夢魚", "庾梦"}  # only these nicknames can be admin across all groups
 HERMES_HOME = Path(os.getenv("HERMES_HOME") or "/root/.hermes")
 STATE_DIR = HERMES_HOME / "wechat_uos"
@@ -74,6 +83,8 @@ CFTC_MEDIA_DIR = CFTC_DIR / "media"
 LSPOSED_DIR = HERMES_HOME / "data" / "lsposed_tracker"
 LSPOSED_CONFIG = LSPOSED_DIR / "config.json"
 LSPOSED_STATE_FILE = LSPOSED_DIR / "state.json"
+# ── 抖音解析 API ─────────────────────────────────────────────────────────
+DOUYIN_API_BASE = "http://192.168.10.216:8002"
 # ── WeRSS 公众号文章推送 ──
 WERSS_BASE = "http://localhost:8001/api/v1/wx"
 WERSS_USER = "admin"
@@ -403,6 +414,12 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 # ── TG forward toggle ──
                 if self._handle_tg_fwd_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
+                # ── 抖音解析 toggle ──
+                if self._handle_douyin_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                # ── 抖音链接解析 ──
+                if self._handle_douyin_parse(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
                 # ── CFTC toggle/upload commands ──
                 if self._handle_cftc_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
@@ -486,19 +503,33 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         look brand new and force admins to run ``授权此群聊`` again.  Keep the
         current group id as the primary key, but restore from a prior authorized
         record with the same display name when a new id appears.
+
+        Scoring: prefer records that have ``allowed_mps`` (user configured
+        subscriptions), then favor more recently updated ones.  This avoids
+        picking an empty restored record (fresh timestamp, no features) over
+        a record that actually has per-group preferences.
         """
         normalized = self._normalize_group_name(group_name)
         if not normalized:
             return None
         groups = self._acl.setdefault("groups", {})
+        best: Optional[Dict[str, Any]] = None
+        best_score = -1
+        best_ts = 0
         for existing_id, existing in groups.items():
             if existing_id == group_id or not isinstance(existing, dict):
                 continue
             if not existing.get("authorized"):
                 continue
             if self._normalize_group_name(existing.get("name", "")) == normalized:
-                return existing
-        return None
+                ts = existing.get("updated_at", 0)
+                has_features = bool(existing.get("allowed_mps"))
+                score = (2 if has_features else 0) + (1 if ts >= best_ts else 0)
+                if score > best_score or (score == best_score and ts >= best_ts):
+                    best = existing
+                    best_score = score
+                    best_ts = ts
+        return best
 
     def _load_acl(self) -> Dict[str, Any]:
         try:
@@ -535,6 +566,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 # new members_cache map so fresh messages can repopulate display
                 # names for this login, but preserve the authorization/admin UID
                 # lists that are stable enough for itchat to match senders.
+                # Also carry over all feature-specific settings (werss, douyin, etc.)
+                # so GID migration doesn't lose per-group preferences.
                 group = {
                     "name": group_name or restored.get("name") or group_id,
                     "authorized": bool(restored.get("authorized")),
@@ -547,6 +580,13 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     "updated_at": now,
                     "restored_from_group_id": restored_from_group_id,
                 }
+                # Carry over feature-specific settings from the old record
+                for _key in ("allowed_mps", "allowed_mps_since", "werss_enabled", "douyin_enabled",
+                             "pansou_enabled", "cftc_enabled", "tg_fwd_enabled",
+                             "tg_forward_enabled", "allow_reply", "auto_reply"):
+                    _val = restored.get(_key)
+                    if _val is not None:
+                        group[_key] = _val
                 groups[group_id] = group
                 logger.info(
                     "WeChatUOS ACL: restored authorization for group=%s new_id=%s old_id=%s",
@@ -1419,6 +1459,205 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             logger.exception("CFTC: upload error")
             return ""
 
+    # ── 抖音解析 ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_douyin_url(text: str) -> Optional[str]:
+        """Extract a Douyin/TikTok share URL from text, or return None."""
+        if not text:
+            return None
+        patterns = [
+            r'https?://v\.douyin\.com/\S+',
+            r'https?://www\.douyin\.com/video/\d+',
+            r'https?://www\.iesdouyin\.com/share/video/\d+',
+            r'https?://v\.tiktok\.com/\S+',
+            r'https?://www\.tiktok\.com/@[^/]+/video/\d+',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return m.group(0).rstrip('/')
+        return None
+
+    def _douyin_is_enabled(self, group_id: str) -> bool:
+        """Check if Douyin parsing is enabled for this group."""
+        with self._acl_lock:
+            return self._group_acl(group_id, "").get("douyin_enabled", True)
+
+    def _handle_douyin_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        """Handle 开启抖音解析 / 关闭抖音解析 commands. Returns True if consumed."""
+        s = (text or "").strip().lower()
+        compact = s.replace(" ", "")
+        if compact in ("开启抖音解析", "关闭抖音解析"):
+            cmd = compact
+        else:
+            parts = s.split()
+            if len(parts) >= 2 and parts[1] in ("开启抖音解析", "关闭抖音解析"):
+                cmd = parts[1]
+            else:
+                return False
+        if self._itchat is None:
+            return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            enable = "开启" in cmd
+            group["douyin_enabled"] = enable
+            self._save_acl()
+        status = "✅ 已开启" if enable else "❌ 已关闭"
+        self._itchat.send(f"{status}抖音链接自动解析", toUserName=group_id)
+        logger.info("WeChatUOS: douyin parse %s for %s", "enabled" if enable else "disabled", group_name)
+        return True
+
+    def _handle_douyin_parse(self, text: str, *, group_id: str, group_name: str, sender: str = "", sender_id: str = "") -> bool:
+        """Parse a Douyin/TikTok video or image post. Returns True if consumed."""
+        url = self._extract_douyin_url(text)
+        if url is None:
+            return False
+        if not self._douyin_is_enabled(group_id):
+            return False
+        if self._itchat is None:
+            return True
+        logger.info("WeChatUOS Douyin: parsing %s in %s", url, group_name)
+        try:
+            api_url = f"{DOUYIN_API_BASE}/api/hybrid/video_data?url={_urlquote(url, safe='')}"
+            req = _URLRequest(api_url, headers={"User-Agent": "Hermes-WeChatUOS/1.0"})
+            with _urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"), strict=False)
+        except Exception as e:
+            logger.exception("WeChatUOS Douyin: API error for %s", url)
+            self._itchat.send(f"❌ 抖音解析失败: {e}", toUserName=group_id)
+            return True
+        code = body.get("api_status_code") or body.get("code")
+        if code != 200:
+            msg = body.get("detail", {}).get("message", "unknown error") if isinstance(body.get("detail"), dict) else body.get("message", str(body))
+            self._itchat.send(f"❌ 抖音解析失败: {msg}", toUserName=group_id)
+            return True
+        data = body.get("api_body", {}).get("data", body.get("data", {}))
+        title = data.get("desc", data.get("title", "无标题"))
+        author_info = data.get("author", {})
+        author = author_info.get("nickname", "") if isinstance(author_info, dict) else str(author_info)
+
+        # ── Detect image post (aweme_type 2 or 68, has "images" field) ──
+        images = data.get("images")
+        is_image_post = isinstance(images, list) and len(images) > 0
+
+        if is_image_post:
+            # ── Handle image post ──
+            self._itchat.send(f"🖼️ {title}（共{len(images)}张）", toUserName=group_id)
+            for idx, img_obj in enumerate(images):
+                if isinstance(img_obj, dict):
+                    img_url = img_obj.get("url_list", [None])[0]
+                else:
+                    img_url = None
+                if not img_url:
+                    continue
+                try:
+                    self._itchat.send(f"⏳ 下载第{idx+1}张图片…", toUserName=group_id)
+                    img_req = _URLRequest(img_url, headers={
+                        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                        "Referer": "https://www.douyin.com/"
+                    })
+                    with _urlopen(img_req, timeout=60) as img_resp:
+                        img_bytes = img_resp.read()
+                    tmp_img = f"/tmp/douyin_img_{int(time.time())}_{idx}.jpg"
+                    with open(tmp_img, "wb") as f:
+                        f.write(img_bytes)
+                    # UOS mode: send_file works better than send_image for images
+                    r = self._itchat.send_file(tmp_img, toUserName=group_id)
+                    import os as _os
+                    _os.unlink(tmp_img)
+                    if not r:
+                        err_msg = r.get("BaseResponse", {}).get("ErrMsg", "未知错误")
+                        logger.warning("WeChatUOS Douyin: send_file failed for image #%d: %s", idx, err_msg)
+                        self._itchat.send(f"❌ 第{idx+1}张图片发送失败", toUserName=group_id)
+                except Exception as e:
+                    logger.exception("WeChatUOS Douyin: image download error #%d for %s", idx, url)
+                    self._itchat.send(f"❌ 第{idx+1}张图片下载失败: {e}", toUserName=group_id)
+            return True
+
+        # ── Handle video post (existing logic) ──
+        # Try multiple paths to get video URL
+        video_url = data.get("video_url", "")
+        if not video_url:
+            play_list = data.get("video_data", [])
+            if play_list:
+                video_url = play_list[0].get("play_addr", "")
+        if not video_url:
+            video_url = data.get("nwm_video_url", "")
+        if not video_url:
+            video_obj = data.get("video", {})
+            if isinstance(video_obj, dict):
+                play_addr = video_obj.get("play_addr", {})
+                if isinstance(play_addr, dict):
+                    url_list = play_addr.get("url_list", [])
+                    if url_list:
+                        video_url = url_list[0]
+        if not video_url:
+            video_obj = data.get("video", {})
+            if isinstance(video_obj, dict):
+                download_addr = video_obj.get("download_addr", {})
+                if isinstance(download_addr, dict):
+                    url_list = download_addr.get("url_list", [])
+                    if url_list:
+                        video_url = url_list[0]
+        if not video_url:
+            self._itchat.send(f"❌ 解析成功但未找到视频链接\n标题: {title}", toUserName=group_id)
+            return True
+        try:
+            logger.info("WeChatUOS Douyin: downloading %s", title[:30])
+            self._itchat.send(f"⏳ 下载中… {title[:30]}", toUserName=group_id)
+
+            # Try H.265 1440p first (higher quality / smaller size)
+            video_obj = data.get("video", {})
+            h265 = video_obj.get("play_addr_265", {})
+            h265_url = h265.get("url_list", [None])[0] if isinstance(h265.get("url_list"), list) else None
+
+            if h265_url and h265.get("height", 0) >= 720:
+                dl_target = h265_url
+                is_hevc = True
+                logger.info("WeChatUOS Douyin: using H.265 %dp source", h265.get("height", 0))
+            else:
+                dl_target = f"{DOUYIN_API_BASE}/api/download?url={_urlquote(url, safe='')}"
+                is_hevc = False
+
+            dl_req = _URLRequest(dl_target, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://www.douyin.com/"
+            } if is_hevc else {"User-Agent": "Hermes-WeChatUOS/1.0"})
+            with _urlopen(dl_req, timeout=120) as dl_resp:
+                data_bytes = dl_resp.read()
+
+            tmp_raw = f"/tmp/douyin_raw_{int(time.time())}.mp4"
+            tmp_out = f"/tmp/douyin_out_{int(time.time())}.mp4"
+            with open(tmp_raw, "wb") as f:
+                f.write(data_bytes)
+
+            import subprocess as _sp
+            ffmpeg_cmd = [
+                "ffmpeg", "-y", "-i", tmp_raw,
+                "-c:v", "libx264", "-preset", "fast",
+                "-crf", "18", "-maxrate", "10M", "-bufsize", "20M",
+                "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart",
+                tmp_out
+            ]
+            _sp.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
+            import os as _os
+            _os.unlink(tmp_raw)
+
+            self._itchat.send_video(tmp_out, toUserName=group_id)
+            _os.unlink(tmp_out)
+            logger.info("WeChatUOS Douyin: sent video '%s' (%d KB)", title[:20], len(data_bytes) // 1024)
+        except Exception as e:
+            logger.exception("WeChatUOS Douyin: download/send error for %s", url)
+            lines = [f"🎬 {title}"]
+            if author:
+                lines.append(f"👤 {author}")
+            lines.append(f"🔗 {video_url}")
+            lines.append("⚠️ 视频直链可能被防刷，点开后复制链接到浏览器打开")
+            self._itchat.send("\n".join(lines), toUserName=group_id)
+        return True
+
     def _handle_cftc_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         """Handle 开启上传 / 关闭上传 commands. Returns True if consumed."""
         s = (text or "").strip().lower()
@@ -1789,23 +2028,140 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         return False
 
     def _handle_werss_text_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
-        s = text.strip().lower().replace(" ", "")
-        # Exact match after removing all spaces
-        if s in {"开启推文", "关闭推文"}:
+        raw = text.strip()
+        lowered = raw.lower()
+        s = lowered.replace(" ", "")
+
+        # ── Whitelist commands: 订阅 / 取消订阅 / 订阅列表 ─────────────────
+        # All are space-tolerant and work with or without bot-name prefix.
+        # Admin-only (same gate as 开启推文/关闭推文).
+        if s in {"订阅列表", "查看订阅"}:
+            cmd = "订阅列表"
+        elif s.startswith("订阅") and len(s) > 2:
+            # "订阅 机器之心" or "订阅机器之心" or "订阅 机器之心,量子位"
+            arg = raw[raw.find("订") + 1:].lstrip(" ,，").strip()
+            cmd = ("订阅", arg)
+        elif s.startswith("取消订阅") and len(s) > 4:
+            arg = raw[raw.find("消") + 4:].lstrip(" ,，").strip()
+            cmd = ("取消订阅", arg)
+        elif s in {"开启推文", "关闭推文"}:
             cmd = s
         else:
-            # Check if command is second word (bot name prefix stripped imperfectly)
-            parts = text.strip().lower().split()
-            if len(parts) >= 2 and parts[1] in {"开启推文", "关闭推文"}:
-                cmd = parts[1]
+            parts = lowered.split()
+            # Bot-name prefix: "dream 订阅列表" → parts[1]="订阅列表"
+            if len(parts) >= 2:
+                part1 = parts[1]
+                if part1 in {"订阅列表", "查看订阅"}:
+                    cmd = "订阅列表"
+                elif part1 == "订阅":
+                    # "dream 订阅 机器之心" → arg from parts[2:]
+                    arg = raw.split(maxsplit=2)[2] if len(parts) >= 3 else ""
+                    cmd = ("订阅", arg.strip())
+                elif part1 == "取消订阅":
+                    arg = raw.split(maxsplit=2)[2] if len(parts) >= 3 else ""
+                    cmd = ("取消订阅", arg.strip())
+                elif part1 in {"开启推文", "关闭推文"}:
+                    cmd = part1
+                else:
+                    return False
             else:
                 return False
+
         if self._itchat is None: return True
         with self._acl_lock:
             group = self._group_acl(group_id, group_name)
             self._remember_member(group, sender_id, nick=sender, display=sender)
-            if not group.get("authorized"): self._itchat.send("当前群尚未授权。", toUserName=group_id); return True
-            if not self._is_group_admin(group, sender, sender_id): self._itchat.send("你没有权限。", toUserName=group_id); return True
+            if not group.get("authorized"):
+                self._itchat.send("当前群尚未授权。", toUserName=group_id); return True
+            if not self._is_group_admin(group, sender, sender_id):
+                self._itchat.send("你没有权限。", toUserName=group_id); return True
+
+        # ── Whitelist command dispatch ─────────────────────────────────
+        if cmd == "订阅列表":
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                allowed = list(group.get("allowed_mps") or [])
+            if not allowed:
+                self._itchat.send(
+                    "📚 本群未设置白名单\n（当前订阅所有公众号推文）",
+                    toUserName=group_id,
+                )
+            else:
+                lines = ["📚 本群订阅的公众号："]
+                for name in allowed:
+                    lines.append(f"• {name}")
+                lines.append("\n发送「取消订阅 公众号名」可移除")
+                self._itchat.send("\n".join(lines), toUserName=group_id)
+            return True
+
+        if isinstance(cmd, tuple) and cmd[0] == "订阅":
+            mp_arg = cmd[1]
+            if not mp_arg:
+                self._itchat.send(
+                    "用法：订阅 公众号名\n例如：订阅 机器之心\n（多个用「,」或「，」分隔）",
+                    toUserName=group_id,
+                )
+                return True
+            new_names = [n.strip() for n in mp_arg.replace("，", ",").split(",") if n.strip()]
+            if not new_names:
+                self._itchat.send("公众号名为空。", toUserName=group_id); return True
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                allowed = list(group.get("allowed_mps") or [])
+                since = dict(group.get("allowed_mps_since") or {})
+                now = int(time.time())
+                added = [n for n in new_names if n not in allowed]
+                for n in added:
+                    since[n] = now
+                allowed.extend(added)
+                group["allowed_mps"] = allowed
+                group["allowed_mps_since"] = since
+                group["updated_at"] = now
+                self._save_acl()
+            if added:
+                self._itchat.send(
+                    f"✅ 已订阅：{', '.join(added)}\n发送「订阅列表」查看",
+                    toUserName=group_id,
+                )
+            else:
+                self._itchat.send("这些公众号已在订阅列表中。", toUserName=group_id)
+            logger.info("WeRSS: subscribed %s for %s by %s", added, group_name, sender)
+            return True
+
+        if isinstance(cmd, tuple) and cmd[0] == "取消订阅":
+            mp_arg = cmd[1]
+            if not mp_arg:
+                self._itchat.send(
+                    "用法：取消订阅 公众号名\n例如：取消订阅 机器之心",
+                    toUserName=group_id,
+                )
+                return True
+            targets = [n.strip() for n in mp_arg.replace("，", ",").split(",") if n.strip()]
+            with self._acl_lock:
+                group = self._group_acl(group_id, group_name)
+                allowed = list(group.get("allowed_mps") or [])
+                if not allowed:
+                    self._itchat.send(
+                        "本群未设置白名单（订阅所有公众号），无需取消。",
+                        toUserName=group_id,
+                    )
+                    return True
+                removed = [n for n in targets if n in allowed]
+                group["allowed_mps"] = [n for n in allowed if n not in targets]
+                # If whitelist becomes empty, drop the key entirely so the group
+                # falls back to the "subscribe all" default.
+                if not group["allowed_mps"]:
+                    group.pop("allowed_mps", None)
+                group["updated_at"] = int(time.time())
+                self._save_acl()
+            if removed:
+                self._itchat.send(f"✅ 已取消订阅：{', '.join(removed)}", toUserName=group_id)
+            else:
+                self._itchat.send("订阅列表中没有这些公众号。", toUserName=group_id)
+            logger.info("WeRSS: unsubscribed %s for %s by %s", removed, group_name, sender)
+            return True
+
+        # ── Existing on/off commands ──────────────────────────────────
         if cmd == "开启推文":
             with self._acl_lock:
                 group = self._group_acl(group_id, group_name)
@@ -1905,22 +2261,30 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 self._werss_fix_deleted_status()
                 new_articles = [a for a in articles if a.get("id") not in last_creates]
                 if new_articles:
-                    # Mark all fetched IDs as seen
                     fresh_ids = set()
-                    # Separate 集客之家 articles for batch pushing
+                    # 集客之家: batch newest 3
                     jk_articles = [a for a in new_articles if a.get("mp_name", "") == "集客之家"]
                     other_articles = [a for a in new_articles if a.get("mp_name", "") != "集客之家"]
-                    # Push non-集客之家 articles individually
+                    # Other accounts: only push the newest article per account per poll
+                    from collections import defaultdict
+                    by_mp: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
                     for a in other_articles:
+                        by_mp[a.get("mp_name", "未知公众号")].append(a)
+                    for mp_name, mp_arts in by_mp.items():
+                        mp_arts.sort(key=lambda a: a.get("publish_time", 0) or a.get("id", ""), reverse=True)
+                        a = mp_arts[0]
                         fresh_ids.add(a.get("id", ""))
                         self._werss_push_article(a)
-                    # Push 集客之家 articles in batches of 3 (newest 3 merged)
+                    # 集客之家: batch newest 3
                     if jk_articles:
                         jk_articles.sort(key=lambda a: a.get("publish_time", 0) or a.get("id", ""), reverse=True)
                         batch = jk_articles[:3]
                         for a in batch:
                             fresh_ids.add(a.get("id", ""))
                         self._werss_push_article_batch(batch)
+                    # Mark ALL fetched articles as seen to avoid re-push
+                    for a in new_articles:
+                        fresh_ids.add(a.get("id", ""))
                     last_creates |= fresh_ids
                     # Prune to last 200 IDs
                     if len(last_creates) > 200:
@@ -1955,6 +2319,34 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         except Exception:
             logger.debug("WeChatUOS WeRSS: fix deleted status skipped", exc_info=True)
 
+    def _werss_get_enabled_groups_for_mp(self, mp_name: str, publish_time: int = 0) -> List[str]:
+        """Return group IDs that are authorized + werss_enabled + allowed to receive ``mp_name``.
+
+        Per-group ``allowed_mps`` whitelist (in ACL group record):
+        - missing or empty list  → group accepts ALL accounts (default, backward-compatible)
+        - non-empty list         → group accepts only listed accounts
+
+        ``publish_time``: article publish timestamp. When the group has an
+        ``allowed_mps_since`` entry for this account, skip articles published
+        before the subscription was made (avoids pushing historical articles).
+        """
+        enabled: List[str] = []
+        with self._acl_lock:
+            for gid, g in list(self._acl.get("groups", {}).items()):
+                if not (g.get("authorized") and g.get("werss_enabled", True)):
+                    continue
+                allowed = g.get("allowed_mps") or []
+                if allowed and mp_name not in allowed:
+                    continue
+                # Skip historical articles published before subscription timestamp
+                if allowed and publish_time:
+                    since = g.get("allowed_mps_since") or {}
+                    mp_since = since.get(mp_name, 0)
+                    if mp_since and publish_time < mp_since:
+                        continue
+                enabled.append(gid)
+        return enabled
+
     def _werss_push_article(self, article: Dict[str, Any]) -> None:
         try:
             art_id = article.get("id", "")
@@ -1962,18 +2354,15 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             title = article.get("title", "无标题")
             url = _to_short_url(article.get("url", ""))
             desc = article.get("description", "")
+            pub_time = article.get("publish_time", 0) or article.get("id", 0)
             # Format message
             msg = f"📰 {mp_name}\n{title}"
             if desc:
                 msg += f"\n{desc}"
             if url:
                 msg += f"\n{url}"
-            # Get enabled groups
-            with self._acl_lock:
-                groups = []
-                for gid, g in list(self._acl.get("groups", {}).items()):
-                    if g.get("authorized") and g.get("werss_enabled", True):
-                        groups.append(gid)
+            # Get enabled groups (filtered by allowed_mps + subscription timestamp)
+            groups = self._werss_get_enabled_groups_for_mp(mp_name, publish_time=pub_time)
             for gid in groups:
                 try:
                     if self._itchat:
@@ -1991,6 +2380,11 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             return
         try:
             mp_name = articles[0].get("mp_name", "未知公众号")
+            # Use the earliest publish time among batch articles to filter
+            earliest_pub = min(
+                (a.get("publish_time", 0) or a.get("id", 0) for a in articles),
+                default=0
+            )
             lines = [f"📰 {mp_name}"]
             for i, art in enumerate(articles, 1):
                 title = art.get("title", "无标题")
@@ -2004,11 +2398,8 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 if url:
                     lines.append(url)
             msg = "\n".join(lines)
-            with self._acl_lock:
-                groups = []
-                for gid, g in list(self._acl.get("groups", {}).items()):
-                    if g.get("authorized") and g.get("werss_enabled", True):
-                        groups.append(gid)
+            # Get enabled groups (filtered by allowed_mps + subscription timestamp)
+            groups = self._werss_get_enabled_groups_for_mp(mp_name, publish_time=earliest_pub)
             for gid in groups:
                 try:
                     if self._itchat:
@@ -2111,138 +2502,144 @@ class WeChatUOSAdapter(BasePlatformAdapter):
 
 
     def _start_tg_fwd(self) -> None:
-        """Start TG forward polling thread. No-op if config not found or thread already running."""
+        """Register TG channel_post forwarder callback. No-op if config not found or registry unavailable."""
+        if not TG_FWD_REGISTRY_AVAILABLE:
+            logger.warning("WeChatUOS TG_fwd: telegram channel_post registry unavailable, skipping")
+            return
         if not TG_FWD_CONFIG.exists():
             logger.info("WeChatUOS TG_fwd: no config at %s, skipping", TG_FWD_CONFIG)
             return
-        t = threading.Thread(target=self._tg_fwd_poll_loop, name="wechat-uos-tg-fwd", daemon=True)
-        t.start()
-        logger.info("WeChatUOS TG_fwd: poller started")
-
-    def _tg_fwd_poll_loop(self) -> None:
-        """Long-poll Telegram channel and forward new posts to configured WeChat groups."""
         TG_FWD_CACHE.mkdir(parents=True, exist_ok=True)
-        last_cleanup = 0.0
-        while True:
-            try:
-                # Hot-reload config each tick
-                if not TG_FWD_CONFIG.exists():
-                    time.sleep(30)
+        try:
+            register_channel_post_forwarder("wechat_uos", self._tg_fwd_callback)
+            logger.info("WeChatUOS TG_fwd: registered channel_post forwarder (no more polling)")
+        except Exception:
+            logger.exception("WeChatUOS TG_fwd: failed to register forwarder")
+
+    def _tg_fwd_callback(self, message) -> None:
+        """Callback invoked by gateway on each channel_post (sync, runs in gateway event loop).
+
+        Receives a PTB Message object (not a raw dict). Converts to dict for
+        compatibility with existing media-download / formatting helpers.
+        """
+        try:
+            # Hot-reload config each invocation
+            if not TG_FWD_CONFIG.exists():
+                return
+            cfg = json.loads(TG_FWD_CONFIG.read_text())
+            rules = cfg.get("forward_rules", [])
+            if not rules:
+                return
+
+            # Identify the source channel from the PTB Message
+            chat = message.chat
+            if not chat:
+                return
+            channel_username = (chat.username or "").strip()
+            channel_id = str(chat.id)
+            channel_key = f"@{channel_username}" if channel_username else channel_id
+
+            # Find matching rules
+            wechat_groups: list[str] = []
+            for rule in rules:
+                tg_channel = rule.get("tg_channel", "").strip()
+                if not tg_channel:
                     continue
-                cfg = json.loads(TG_FWD_CONFIG.read_text())
-                token = cfg.get("bot_token", "")
-                if not token:
-                    time.sleep(30)
+                norm_rule = tg_channel.lstrip("@").lower()
+                norm_channel = channel_username.lower()
+                if norm_rule and norm_channel and norm_rule == norm_channel:
+                    wechat_groups.extend(rule.get("wechat_groups", []))
+                elif tg_channel == channel_id:
+                    wechat_groups.extend(rule.get("wechat_groups", []))
+
+            if not wechat_groups:
+                return
+
+            msg_id = message.message_id
+            if not msg_id:
+                return
+
+            # Deduplicate by last_msg_id state
+            state = _tg_fwd_load_state(channel_key)
+            if state.get("last_msg_id") is not None and msg_id <= state.get("last_msg_id", 0):
+                return
+
+            # Convert PTB Message to dict for helper compatibility
+            msg_dict = message.to_dict()
+
+            # Format text
+            formatted = _tg_format(msg_dict)
+
+            # Download media if present
+            token = cfg.get("bot_token", "")
+            media_path = None
+            if token and any(
+                k in msg_dict for k in ("photo", "video", "document", "audio", "animation", "voice")
+            ):
+                media_path = _tg_download_media(token, msg_dict, msg_id, TG_FWD_CACHE)
+
+            logger.info(
+                "WeChatUOS TG_fwd: forwarding msg %s from %s (media: %s)",
+                msg_id, channel_key, media_path.name if media_path else "none",
+            )
+
+            # Send to each configured WeChat group
+            itchat = self._itchat
+            if itchat is None:
+                return
+
+            for wx_group in wechat_groups:
+                if not _tg_fwd_is_enabled(wx_group):
+                    logger.debug("WeChatUOS TG_fwd: forwarding disabled for %s", wx_group)
                     continue
-                rules = cfg.get("forward_rules", [])
-                if not rules:
-                    time.sleep(30)
-                    continue
-
-                for rule in rules:
-                    tg_channel = rule.get("tg_channel", "")
-                    wechat_groups = rule.get("wechat_groups", [])
-                    if not tg_channel or not wechat_groups:
-                        continue
-
-                    # Load state
-                    state = _tg_fwd_load_state(tg_channel)
-                    last_update_id = state.get("last_update_id")
-
-                    # Long-poll with 30s timeout
-                    params = {"timeout": 30, "limit": 10, "allowed_updates": json.dumps(["channel_post"])}
-                    if last_update_id:
-                        params["offset"] = last_update_id
-
-                    result = _tg_api_call(token, "getUpdates", params, timeout=35)
-                    if not result.get("ok"):
-                        continue
-
-                    updates = result.get("result", [])
-                    if not updates:
-                        continue
-
-                    for update in updates:
-                        update_id = update.get("update_id")
-                        msg = update.get("channel_post")
-                        if not msg:
-                            continue
-                        msg_id = msg.get("message_id")
-                        if not msg_id:
-                            continue
-                        if state.get("last_msg_id") is not None and msg_id is not None and msg_id <= state.get("last_msg_id", 0):
-                            continue
-
-                        # Format text
-                        formatted = _tg_format(msg)
-                        # Download media if present
-                        media_path = _tg_download_media(token, msg, msg_id, TG_FWD_CACHE) if any(
-                            k in msg for k in ("photo", "video", "document", "audio", "animation", "voice")
-                        ) else None
-
-                        logger.info("WeChatUOS TG_fwd: forwarding msg %s from %s (media: %s)",
-                                     msg_id, tg_channel, media_path.name if media_path else "none")
-
-                        # Send to each configured WeChat group
-                        for wx_group in wechat_groups:
-                            if not _tg_fwd_is_enabled(wx_group):
-                                logger.debug("WeChatUOS TG_fwd: forwarding disabled for %s", wx_group)
-                                continue
-                            itchat = self._itchat
-                            if itchat is None:
-                                continue
-                            # Send text
-                            if formatted:
-                                try:
-                                    itchat.send(formatted, toUserName=wx_group)
-                                except Exception as e:
-                                    logger.error("WeChatUOS TG_fwd: text send to %s failed: %s", wx_group, e)
-                            # Send media
-                            if media_path:
-                                try:
-                                    ext = media_path.suffix.lower()
-                                    if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
-                                        ok = itchat.send_image(str(media_path), toUserName=wx_group)
-                                        if ok is False or ok is None:
-                                            ok = itchat.send_file(str(media_path), toUserName=wx_group)
-                                    else:
-                                        ok = itchat.send_file(str(media_path), toUserName=wx_group)
-                                    if ok is False or ok is None:
-                                        logger.warning("WeChatUOS TG_fwd: media failed for %s -> %s", media_path.name, wx_group)
-                                except Exception as e:
-                                    logger.error("WeChatUOS TG_fwd: media send to %s failed: %s", wx_group, e)
-
-                        # Cleanup media file after forwarding
-                        if media_path and media_path.exists():
-                            try:
-                                media_path.unlink()
-                            except Exception:
-                                pass
-
-                        # Update state
-                        if msg_id is not None:
-                            state["last_msg_id"] = msg_id
-                        state["last_update_id"] = update_id + 1
-
-                    _tg_fwd_save_state(tg_channel, state)
-
-                # Periodic media cache cleanup (every 5 min)
-                now = time.time()
-                if now - last_cleanup > 300:
-                    last_cleanup = now
+                # ── Send text ──
+                if formatted:
                     try:
-                        cutoff = now - 3600
-                        for f in TG_FWD_CACHE.iterdir():
-                            if f.is_file() and f.stat().st_mtime < cutoff:
-                                f.unlink()
-                    except Exception:
-                        pass
+                        itchat.send(formatted, toUserName=wx_group)
+                    except Exception as e:
+                        logger.error("WeChatUOS TG_fwd: text send to %s failed: %s", wx_group, e)
+                # ── Send media ──
+                if media_path:
+                    try:
+                        ext = media_path.suffix.lower()
+                        if ext in (".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"):
+                            ok = itchat.send_image(str(media_path), toUserName=wx_group)
+                            if ok is False or ok is None:
+                                ok = itchat.send_file(str(media_path), toUserName=wx_group)
+                        else:
+                            ok = itchat.send_file(str(media_path), toUserName=wx_group)
+                        if ok is False or ok is None:
+                            logger.warning(
+                                "WeChatUOS TG_fwd: media failed for %s -> %s",
+                                media_path.name, wx_group,
+                            )
+                    except Exception as e:
+                        logger.error(
+                            "WeChatUOS TG_fwd: media send to %s failed: %s", wx_group, e,
+                        )
 
-                time.sleep(1)  # small sleep between rule loops, then back to long-poll
+            # Cleanup media file after forwarding
+            if media_path and media_path.exists():
+                try:
+                    media_path.unlink()
+                except Exception:
+                    pass
 
+            # Update state
+            state["last_msg_id"] = msg_id
+            _tg_fwd_save_state(channel_key, state)
+
+            # Periodic media cache cleanup (every ~100 calls)
+            try:
+                cutoff = time.time() - 3600
+                for f in TG_FWD_CACHE.iterdir():
+                    if f.is_file() and f.stat().st_mtime < cutoff:
+                        f.unlink()
             except Exception:
-                logger.exception("WeChatUOS TG_fwd: poll loop error, sleeping 30s")
-                time.sleep(30)
+                pass
+
+        except Exception:
+            logger.exception("WeChatUOS TG_fwd: callback error")
 
 
 def check_requirements() -> bool:
