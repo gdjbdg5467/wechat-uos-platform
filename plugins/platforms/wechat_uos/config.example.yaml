@@ -1,0 +1,30 @@
+# Hermes Agent 配置模板 — WeChat Services
+# 将此文件集成到你的 ~/.hermes/config.yaml 中
+
+plugins:
+  - platform: wechat_uos
+    enabled: true
+
+env:
+  # ── 基础 ──
+  WECHAT_UOS_ENABLED: true
+
+  # ── 权限控制 ──
+  WECHAT_UOS_ALLOWED_GROUPS: ""   # 逗号分隔群ID或名称，空=所有群
+  WECHAT_UOS_ALLOWED_USERS: ""    # 逗号分隔昵称，空=所有用户
+
+  # ── 消息 ──
+  WECHAT_UOS_RESPOND_TO_DMS: false  # 是否响应私聊
+
+  # ── QR 码 ──
+  WECHAT_UOS_QR_HTTP: true      # HTTP 页面展示二维码
+  WECHAT_UOS_QR_PORT: 8646      # QR 服务端口
+
+  # ── 通知 ──
+  WECHAT_UOS_HOME_CHANNEL: ""   # 默认通知群组（@@群ID）
+
+# ── 注意事项 ──
+# 数据文件保存在 ~/.hermes/data/wechat_uos/ 下
+# 包含：acl.json（授权记录）、itchat.pkl（登录态）、
+# tg_fwd/（TG转发配置）、lsposed/（模块更新配置）
+# 定期备份 acl.json 和 itchat.pkl

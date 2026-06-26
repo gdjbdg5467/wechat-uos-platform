@@ -193,6 +193,11 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         # ── LSPosed tracker state ──
         self._lsposed_stop = threading.Event()
         self._lsposed_thread: Optional[threading.Thread] = None
+        # ── DEBUG: monkey-patch itchat send to log responses ──
+        try:
+            from . import hermes_debug_send  # noqa: F401
+        except Exception:
+            pass
         # ── WeRSS poller state ──
         self._werss_stop = threading.Event()
         self._werss_thread: Optional[threading.Thread] = None
@@ -308,6 +313,10 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._fix_tg_fwd_token()
         except Exception:
             logger.exception("WeChatUOS: tg_fwd token fix failed")
+        try:
+            self._cleanup_stale_gids()
+        except Exception:
+            logger.exception("WeChatUOS: stale GID cleanup failed")
 
     def _migrate_home_channel_gid(self) -> None:
         """Find the current '机器人测试' group GID and update home channel."""
@@ -599,6 +608,11 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 )
                 # Also migrate GID in tg_fwd config and CFTC group state
                 self._migrate_external_gid(restored_from_group_id, group_id, group.get("name") or group_name)
+                # Remove the old GID entry to prevent ACL bloat;
+                # it's been fully migrated to the new GID above.
+                if restored_from_group_id in groups and restored_from_group_id != group_id:
+                    del groups[restored_from_group_id]
+                    logger.debug("WeChatUOS ACL: removed migrated old GID %s", restored_from_group_id[:20])
         if not isinstance(group, dict):
             group = groups.setdefault(group_id, {
                 "name": group_name or group_id,
@@ -625,6 +639,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         group.setdefault("restored_from_group_id", "")
         group.setdefault("lsposed_enabled", False)
         group.setdefault("werss_enabled", True)
+        group.setdefault("douyin_enabled", False)
         if group.get("restored_from_group_id") and group.get("updated_at") == now:
             self._save_acl()
         return group
@@ -1485,7 +1500,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
     def _douyin_is_enabled(self, group_id: str) -> bool:
         """Check if Douyin parsing is enabled for this group."""
         with self._acl_lock:
-            return self._group_acl(group_id, "").get("douyin_enabled", True)
+            return self._group_acl(group_id, "").get("douyin_enabled", False)
 
     def _handle_douyin_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
         """Handle 开启抖音解析 / 关闭抖音解析 commands. Returns True if consumed."""
@@ -1503,6 +1518,12 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             return True
         with self._acl_lock:
             group = self._group_acl(group_id, group_name)
+            if not group.get("authorized"):
+                self._itchat.send("本群尚未开启 Hermes，请先发送：开启授权", toUserName=group_id)
+                return True
+            if not self._is_group_admin(group, sender, sender_id):
+                self._itchat.send("你没有权限管理抖音解析。", toUserName=group_id)
+                return True
             enable = "开启" in cmd
             group["douyin_enabled"] = enable
             self._save_acl()
@@ -1516,26 +1537,40 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         url = self._extract_douyin_url(text)
         if url is None:
             return False
-        if not self._douyin_is_enabled(group_id):
-            return False
         if self._itchat is None:
             return True
+        # Must be authorized
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            if not group.get("authorized"):
+                return False
+        if not self._douyin_is_enabled(group_id):
+            return False
         logger.info("WeChatUOS Douyin: parsing %s in %s", url, group_name)
+
+        # ── Try API (requires valid cookies) ──
+        body = None
         try:
             api_url = f"{DOUYIN_API_BASE}/api/hybrid/video_data?url={_urlquote(url, safe='')}"
             req = _URLRequest(api_url, headers={"User-Agent": "Hermes-WeChatUOS/1.0"})
             with _urlopen(req, timeout=30) as resp:
                 body = json.loads(resp.read().decode("utf-8"), strict=False)
-        except Exception as e:
-            logger.exception("WeChatUOS Douyin: API error for %s", url)
-            self._itchat.send(f"❌ 抖音解析失败: {e}", toUserName=group_id)
-            return True
-        code = body.get("api_status_code") or body.get("code")
-        if code != 200:
-            msg = body.get("detail", {}).get("message", "unknown error") if isinstance(body.get("detail"), dict) else body.get("message", str(body))
-            self._itchat.send(f"❌ 抖音解析失败: {msg}", toUserName=group_id)
-            return True
-        data = body.get("api_body", {}).get("data", body.get("data", {}))
+        except Exception:
+            logger.warning("WeChatUOS Douyin: API error (failing over to page scrape)")
+
+        if body is not None:
+            code = body.get("api_status_code") or body.get("code")
+            if code == 200:
+                # ── API succeeded, proceed normally ──
+                data = body.get("api_body", {}).get("data", body.get("data", {}))
+                return self._douyin_handle_api_data(data, url, group_id, group_name)
+
+        # ── Fallback: scrape share page (no auth required) ──
+        logger.info("WeChatUOS Douyin: fallback scraping %s", url)
+        return self._douyin_fallback_scrape(url, group_id)
+
+    def _douyin_handle_api_data(self, data: dict, url: str, group_id: str, group_name: str) -> bool:
+        """Handle successful API response data (download & send media)."""
         title = data.get("desc", data.get("title", "无标题"))
         author_info = data.get("author", {})
         author = author_info.get("nickname", "") if isinstance(author_info, dict) else str(author_info)
@@ -1630,27 +1665,14 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             with _urlopen(dl_req, timeout=120) as dl_resp:
                 data_bytes = dl_resp.read()
 
-            tmp_raw = f"/tmp/douyin_raw_{int(time.time())}.mp4"
-            tmp_out = f"/tmp/douyin_out_{int(time.time())}.mp4"
-            with open(tmp_raw, "wb") as f:
+            tmp_path = f"/tmp/douyin_{int(time.time())}.mp4"
+            with open(tmp_path, "wb") as f:
                 f.write(data_bytes)
 
-            import subprocess as _sp
-            ffmpeg_cmd = [
-                "ffmpeg", "-y", "-i", tmp_raw,
-                "-c:v", "libx264", "-preset", "fast",
-                "-crf", "18", "-maxrate", "10M", "-bufsize", "20M",
-                "-c:a", "aac", "-b:a", "128k",
-                "-movflags", "+faststart",
-                tmp_out
-            ]
-            _sp.run(ffmpeg_cmd, capture_output=True, text=True, timeout=300)
             import os as _os
-            _os.unlink(tmp_raw)
-
-            self._itchat.send_video(tmp_out, toUserName=group_id)
-            _os.unlink(tmp_out)
-            logger.info("WeChatUOS Douyin: sent video '%s' (%d KB)", title[:20], len(data_bytes) // 1024)
+            self._itchat.send_video(tmp_path, toUserName=group_id)
+            _os.unlink(tmp_path)
+            logger.info("WeChatUOS Douyin: sent original file '%s' (%d KB)", title[:20], len(data_bytes) // 1024)
         except Exception as e:
             logger.exception("WeChatUOS Douyin: download/send error for %s", url)
             lines = [f"🎬 {title}"]
@@ -1659,6 +1681,47 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             lines.append(f"🔗 {video_url}")
             lines.append("⚠️ 视频直链可能被防刷，点开后复制链接到浏览器打开")
             self._itchat.send("\n".join(lines), toUserName=group_id)
+        return True
+
+    def _douyin_fallback_scrape(self, url: str, group_id: str) -> bool:
+        """Fallback when API is unavailable: scrape share page for basic info (no auth needed)."""
+        try:
+            # Resolve short URL to get actual video page
+            req = _URLRequest(url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Accept": "text/html,application/xhtml+xml",
+            })
+            with _urlopen(req, timeout=15) as resp:
+                html_bytes = resp.read()
+                # Try to extract encoding from headers or content
+                try:
+                    page_text = html_bytes.decode("utf-8")
+                except UnicodeDecodeError:
+                    page_text = html_bytes.decode("utf-8", errors="replace")
+
+            # Try to extract title from og:title
+            title = "抖音视频"
+            m = re.search(r'<meta\s+property="og:title"\s+content="([^"]*)"', page_text)
+            if m:
+                title = html.unescape(m.group(1))
+
+            # Try to extract description
+            desc = ""
+            m = re.search(r'<meta\s+name="description"\s+content="([^"]*)"', page_text)
+            if m:
+                desc = html.unescape(m.group(1))[:100]
+
+            lines = [f"🎬 {title}"]
+            if desc:
+                lines.append(f"📝 {desc}")
+            lines.append(f"🔗 {url}")
+            lines.append("⚠️ API授权过期，请更新抖音Cookie后使用完整解析")
+            self._itchat.send("\n".join(lines), toUserName=group_id)
+            logger.info("WeChatUOS Douyin: fallback sent basic info for %s", url)
+        except Exception as e:
+            # Last resort: just send the link
+            logger.warning("WeChatUOS Douyin: fallback scrape failed: %s", e)
+            self._itchat.send(f"🎬 抖音视频\n🔗 {url}", toUserName=group_id)
         return True
 
     # ── 帮助 ────────────────────────────────────────────────────────────────
@@ -1828,7 +1891,6 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 desc = mod.get("description", "")
                 old_ver = state.get("modules", {}).get(mname, "")
                 if ver and ver != old_ver: updates.append({"type": "module", "name": mname, "description": desc, "version": ver, "old_version": old_ver, "mod": mod})
-            state.setdefault("modules", {}).update({u["name"]: u["version"] for u in updates})
         import urllib.request
         for repo in cfg.get("custom_repos", []):
             if len(updates) >= max_up: break
@@ -1842,23 +1904,36 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 if tag and tag != old_tag:
                     asset = (release.get("assets") or [{}])[0]
                     updates.append({"type": "custom", "name": label, "version": tag, "old_version": old_tag, "url": asset.get("browser_download_url", ""), "body": (release.get("body") or "")[:500]})
-                state.setdefault("custom_repos", {})[f"{owner}/{repo_name}"] = tag
             except Exception: logger.debug("LSPosed: GitHub fetch failed for %s/%s", owner, repo_name)
-        state["last_polled_at"] = int(time.time())
-        self._lsposed_save_state(state)
         if first_run:
             has_history = bool(state.get("modules")) or bool(state.get("custom_repos"))
             if not has_history:
+                # Save baseline state on first run even without delivery
+                state.setdefault("modules", {}).update({u["name"]: u["version"] for u in updates})
+                for repo in cfg.get("custom_repos", []):
+                    owner, repo_name = repo.get("owner", ""), repo.get("repo", "")
+                    if owner and repo_name and f"{owner}/{repo_name}" not in state.get("custom_repos", {}):
+                        pass  # first-run with no custom state yet — fine
+                state["last_polled_at"] = int(time.time())
+                self._lsposed_save_state(state)
                 logger.info("LSPosed: first-run baseline %d modules, %d custom repos", len(state.get("modules", {})), len(state.get("custom_repos", {})))
                 return 0
             logger.info("LSPosed: first-run with history, %d updates detected", len(updates))
-        if not updates: return 0
+        if not updates: 
+            state["last_polled_at"] = int(time.time())
+            self._lsposed_save_state(state)
+            return 0
         groups = cfg.get("target_groups", [])
         # Load ACL once for permission checks
         with self._acl_lock:
             acl_groups = json.loads(ACL_FILE.read_text()).get("groups", {}) if ACL_FILE.exists() else {}
+        sent_updates = []
         for up in updates[:max_up]:
-            msg = self._lsposed_format_update(up)
+            try:
+                msg = self._lsposed_format_update(up)
+            except Exception:
+                logger.exception("LSPosed: format failed for %s", up.get("name", "?"))
+                continue
             sent = False
             for gid in groups:
                 if not self._itchat:
@@ -1873,8 +1948,21 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 except Exception:
                     logger.warning("LSPosed: send to %s failed", gid)
             if sent:
+                sent_updates.append(up)
                 logger.info("LSPosed: pushed update for %s -> %s", up["name"], up["version"])
-        return len(updates)
+        # Only save state for successfully delivered updates
+        if sent_updates:
+            state.setdefault("modules", {}).update({u["name"]: u["version"] for u in sent_updates if u.get("type") == "module"})
+            for up in sent_updates:
+                if up.get("type") == "custom":
+                    # Find the repo key from name
+                    for repo in cfg.get("custom_repos", []):
+                        if repo.get("name") == up.get("name"):
+                            state.setdefault("custom_repos", {})[f"{repo['owner']}/{repo['repo']}"] = up["version"]
+                            break
+        state["last_polled_at"] = int(time.time())
+        self._lsposed_save_state(state)
+        return len(sent_updates)
 
     def _lsposed_fetch_modules(self, cfg: dict) -> list:
         """Fetch Xposed modules via GitHub GraphQL API. Falls back to local cache."""
@@ -2019,10 +2107,18 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             dl_url = up.get("url", "")
         elif t == "module":
             mod = up.get("mod", {})
-            lr = mod.get("latestRelease") or {}
-            assets = lr.get("releaseAssets", {}).get("nodes", [])
-            if assets:
-                dl_url = assets[0].get("downloadUrl", "")
+            if isinstance(mod, dict):
+                lr = mod.get("latestRelease")
+                if isinstance(lr, dict):
+                    assets = lr.get("releaseAssets", {}).get("nodes", [])
+                else:
+                    assets = []
+            else:
+                assets = []
+            if assets and isinstance(assets, list):
+                first = assets[0]
+                if isinstance(first, dict):
+                    dl_url = first.get("downloadUrl", "")
         if dl_url:
             lines.append(f"链接：{dl_url}")
         if t == "custom":
@@ -2335,9 +2431,10 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     for a in new_articles:
                         fresh_ids.add(a.get("id", ""))
                     last_creates |= fresh_ids
-                    # Prune to last 200 IDs
-                    if len(last_creates) > 200:
-                        last_creates = set(sorted(last_creates, reverse=True)[:200])
+                    # Prune to last 2000 IDs (was 200 — too small, old articles
+                    # get pushed out of tracking and re-pushed every cycle)
+                    if len(last_creates) > 2000:
+                        last_creates = set(sorted(last_creates, reverse=True)[:2000])
                     try:
                         WERSS_STATE_FILE.write_text(json.dumps({
                             "seen_ids": sorted(last_creates),
@@ -2547,8 +2644,85 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         except Exception:
             logger.exception("WeChatUOS GID migration: error updating external configs for %s", old_gid)
 
+    def _cleanup_stale_gids(self) -> None:
+        """Remove stale/old GIDs from ACL and gid_name_map after a login cycle.
 
+        After WeChat UOS reconnects, group GIDs often change. The ACL accumulates
+        entries for old GIDs that are no longer valid. This method scans the
+        current itchat chatrooms and purges any ACL / gid_name_map entries that
+        no longer correspond to an active WeChat group.
+        """
+        try:
+            if not PKL_FILE.exists():
+                return
+            import pickle
+            with open(PKL_FILE, "rb") as f:
+                pkl_state = pickle.load(f)
+            storage = pkl_state.get("storage", {}) or {}
+            # Try chatroomList first, then fall back to other known keys
+            chatrooms = storage.get("chatroomList", []) or storage.get("chatrooms", []) or []
+            if not chatrooms:
+                # Fallback: scan storage for a dict-like list of chatrooms
+                for v in storage.values():
+                    if isinstance(v, (list, tuple)) and v:
+                        sample = v[0]
+                        if isinstance(sample, dict) and sample.get("UserName", "").startswith("@@"):
+                            chatrooms = v
+                            break
+            if not chatrooms:
+                return
 
+            current_gids = set()
+            for room in chatrooms:
+                gid = room.get("UserName", "")
+                name = room.get("NickName", "")
+                members = room.get("MemberCount", 0) or 0
+                if gid and gid.startswith("@@") and name and members >= 3:
+                    current_gids.add(gid)
+
+            if not current_gids:
+                return
+
+            # 1. Clean ACL — only remove unauthorized stale entries;
+            #    authorized groups are kept so _find_restorable_group_acl
+            #    can migrate them by name when a message arrives from the new GID.
+            with self._acl_lock:
+                groups = self._acl.get("groups", {})
+                before = len(groups)
+                stale = [
+                    gid for gid in groups
+                    if gid not in current_gids and gid.startswith("@@")
+                    and not (isinstance(groups[gid], dict) and groups[gid].get("authorized"))
+                ]
+                for gid in stale:
+                    name = groups[gid].get("name", "?") if isinstance(groups[gid], dict) else "?"
+                    del groups[gid]
+                    logger.info("WeChatUOS cleanup: removed stale ACL entry %s (%s)", name, gid[:20])
+                if stale:
+                    self._save_acl()
+                    logger.info("WeChatUOS cleanup: ACL pruned %d stale GIDs (%d -> %d)", len(stale), before, len(groups))
+
+            # 2. Clean gid_name_map.json
+            gid_map_file = STATE_DIR / "gid_name_map.json"
+            if gid_map_file.exists():
+                try:
+                    gm = json.loads(gid_map_file.read_text())
+                    bg = gm.get("by_gid", {})
+                    bg_before = len(bg)
+                    stale_bg = [g for g in bg if g not in current_gids and g.startswith("@@")]
+                    for g in stale_bg:
+                        del bg[g]
+                    gm["by_gid"] = bg
+                    if gm.get("updated_at"):
+                        gm["updated_at"] = 9999999999
+                    gid_map_file.write_text(json.dumps(gm, ensure_ascii=False, indent=2))
+                    if stale_bg:
+                        logger.info("WeChatUOS cleanup: gid_name_map pruned %d stale entries (%d -> %d)",
+                                    len(stale_bg), bg_before, len(bg))
+                except Exception:
+                    logger.debug("WeChatUOS cleanup: gid_name_map update failed", exc_info=True)
+        except Exception:
+            logger.debug("WeChatUOS cleanup: skipped (pickle not ready or no chatrooms)", exc_info=True)
 
     def _start_tg_fwd(self) -> None:
         """Register TG channel_post forwarder callback. No-op if config not found or registry unavailable."""
