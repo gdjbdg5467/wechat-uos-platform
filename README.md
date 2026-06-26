@@ -1,167 +1,141 @@
-# Hermes Agent — WeChat UOS Adapter
+# WeChat Services — Hermes Agent 插件集
 
-> Hermes Agent 插件：微信（itchat-uos 协议）多功能机器人，集成群 ACL 授权、盘搜、抖音解析、公众号推送、TG 转发、图床上传、LSPosed 模块更新追踪。
+微信生态功能插件合集，作为 [Hermes Agent](https://hermes-agent.nousresearch.com) 的插件运行。
 
-## 功能概览
+## 安装
 
-| 功能 | 说明 |
-|------|------|
-| **微信登录** | itchat-uos 逆向协议，QR 码扫码，支持热重载（pkl） |
-| **群 ACL 授权** | 三级权限：全局管理员 → 群管理员 → 授权用户，GID 自动迁移 |
-| **盘搜** | 夸克 / 115 / 百度 / UC / 磁力 资源搜索 |
-| **抖音解析** | 自动识别并解析抖音/TikTok 视频和图片帖 |
-| **公众号订阅** | 基于 WeRSS 的公众号文章推送，支持白名单 + 订阅时间过滤 |
-| **TG 转发** | Telegram 频道消息自动转发到微信群（channel_post 回调，无轮询） |
-| **CFTC 图床上传** | 图片/文件上传到 CFTC 图床 |
-| **模块更新追踪** | LSPosed Xposed 模块 GitHub Release 监控与推送 |
-| **群聊接入 Hermes AI** | 微信群 @机器人 直接对话 |
-
-## 架构
-
-```
-hermes-agent/plugins/platforms/wechat_uos/
-├── adapter.py          # 主适配器 (WeChatUOSAdapter)
-├── __init__.py         # 插件入口
-├── plugin.yaml         # 插件元数据
-├── README.md           # 本文件
-└── config.example.yaml # 配置示例
+```bash
+cd ~/.hermes/hermes-agent/plugins/platforms/
+git clone https://github.com/gdjbdg5467/wechat-uos-platform.git wechat_uos
 ```
 
-依赖外部服务：
-- **WeRSS** (`http://localhost:8001`) — 公众号文章抓取
-- **盘搜 API** (`http://localhost:850`) — 网盘资源搜索
-- **抖音解析 API** (`http://192.168.10.216:8002`) — 抖音链接解析
-- **Telegram Bot API** — TG 频道转发（需 bot token）
-
-## 配置
-
-编辑 Hermes Agent 的 `config.yaml`，在 `plugins` 下配置：
+然后在 `~/.hermes/config.yaml` 中添加：
 
 ```yaml
 plugins:
-  wechat_uos:
+  - platform: wechat_uos
     enabled: true
-    admin_users: "昵称1,昵称2"          # 全局管理员（群昵称）
-    pansou_api: "http://192.168.1.100:850/api/search"
-    qr_http: true
-    qr_port: 8646
+env:
+  WECHAT_UOS_ENABLED: true
 ```
 
-TG 转发配置（`~/.hermes/data/tg_fwd/config.json`）：
+## WeChat UOS Platform
 
-```json
-{
-  "bot_token": "123456:ABC-DEF1234ghIkl-zyx57W2v1u123ew11",
-  "forward_rules": [
-    {
-      "tg_channel": "@channel_name",
-      "wechat_groups": ["@@wechat_group_id"]
-    }
-  ]
-}
-```
+基于 itchat-uos（逆向 UOS 微信协议）的个人微信网关适配器。支持 QR 扫码登录、热重载、群 @ 消息处理。
 
-LSPosed 配置（`~/.hermes/data/lsposed_tracker/config.json`）：
+插件路径：`plugins/platforms/wechat_uos/`
 
-```json
-{
-  "enabled": true,
-  "target_groups": ["@@group_id"],
-  "github_token": "ghp_xxx",
-  "interval_seconds": 1800,
-  "custom_repos": [
-    {"owner": "mytv-android", "repo": "myDV", "name": "myTV/myDV"}
-  ]
-}
-```
+### 功能模块
 
-## 群聊命令
+#### 微信登录
+QR 码扫码登录（支持 HTTP 页面展示二维码），热重载（自动重启无需重新扫码），可配置静默启动防重播。
 
-在微信群中 `@机器人` + 命令：
+#### 群授权系统
+三级权限体系：全局管理员 → 群管理员 → 授权用户。群首次 @ 机器人并发送"开启授权"即完成授权。
 
-### 授权管理
+**ACL 持久化：** 网关重启后自动保持授权状态和功能设置。UOS 重连导致 GID 变化时自动按群名匹配迁移，不丢失配置。旧 GID 自动清理，避免 ACL 膨胀。
 
-| 命令 | 说明 | 权限 |
-|------|------|------|
-| `开启授权` / `授权此群聊` | 首次发送者自动成为管理员 | 任意成员 |
-| `关闭授权` | 关闭本群授权 | 管理员 |
-| `授权 昵称` | 授权成员使用功能 | 管理员 |
-| `取消授权 昵称` | 取消成员权限（不包含管理员） | 管理员 |
-| `设管理员 昵称` | 设置群管理员 | 管理员 |
-| `取消管理员 昵称` | 移除管理员 | 管理员 |
-| `权限列表` / `名单` / `acl` | 查看本群 ACL | 管理员 |
-| `刷新成员` / `刷新群成员` | 刷新群成员列表 | 管理员 |
+#### 公众号订阅（WeRSS）
+集成 WeRSS 公众号抓取服务，自动拉取已订阅公众号的新文章。
 
-### 盘搜
+- 授权后发送 `@机器人 订阅 <公众号名>` 即可订阅
+- 集客之家：每轮推送最新 3 篇
+- 其他公众号：每号每轮推送最新 1 篇
+- 链接格式：`mp.weixin.qq.com/s/...` 直链，展示微信卡片
 
-| 命令 | 说明 |
-|------|------|
-| `搜索 <关键词>` | 搜索夸克/115/百度/UC 网盘资源 |
-| `开启盘搜` / `关闭盘搜` | 盘搜开关（管理员） |
+#### 抖音解析
+自动解析群内分享的抖音/ TikTok 视频链接和图文，下载并发送原始视频到群内。
 
-### 抖音解析
+- `开启抖音解析` / `关闭抖音解析` — 开关（仅管理员）
+- 默认关闭，需群授权后才生效
+- 使用 `send_video` 发送，微信内直接播放
+- API 失败时自动降级为页面抓取
 
-| 命令 | 说明 |
-|------|------|
-| `开启抖音解析` / `关闭抖音解析` | 自动解析开关（管理员） |
-| *(直接发抖音链接)* | 自动解析并发送视频/图片 |
+#### 盘搜
+夸克/115/百度/UC网盘资源搜索。群内发送 `@机器人 搜索 <关键词>` 即可。管理员可单独开关此功能。
 
-支持链接格式：`v.douyin.com`、`www.douyin.com/video/`、`www.iesdouyin.com/share/video/`、TikTok 链接。
+#### TG 转发
+Telegram 频道消息自动转发到指定微信群。支持文字、图片、视频、文件。管理员可单独开关。自动添加新授权群到转发配置。
 
-### 公众号订阅（WeRSS）
+#### CFTC 上传
+群内发送图片/文件后发送 `@机器人 上传` 自动上传到 CFTC 图床。管理员可单独开关。
 
-| 命令 | 说明 |
-|------|------|
-| `订阅 公众号名` | 添加白名单，支持用「,」分隔多个 |
-| `取消订阅 公众号名` | 移除白名单 |
-| `订阅列表` / `查看订阅` | 查看本群已订阅的公众号 |
-| `开启推文` / `关闭推文` | 公众号推送开关（管理员） |
+#### LSPosed 模块更新追踪
+监控 Xposed 模块市场及自定义 GitHub 仓库，有新版本时自动推送到微信群。管理员可单独开关。
 
-### TG 转发
+#### 消息撤回通知
+监听到群消息撤回时自动通知群内。格式：机器人名 + 中文日期时间 + 来源群 + 发送者 + 撤回类型 + 原文。
 
-| 命令 | 说明 |
-|------|------|
-| `开启转发` / `关闭转发` | TG 频道→群转发开关（管理员） |
+### 环境变量
 
-### CFTC 图床
+| 变量 | 说明 | 默认值 |
+|---|---|---|
+| `WECHAT_UOS_ENABLED` | 启用插件 | `false` |
+| `WECHAT_UOS_ALLOWED_GROUPS` | 允许的群组 ID/名称，逗号分隔 | 空（所有群） |
+| `WECHAT_UOS_ALLOWED_USERS` | 允许的用户昵称，逗号分隔 | 空（所有用户） |
+| `WECHAT_UOS_RESPOND_TO_DMS` | 是否响应私聊 | `false` |
+| `WECHAT_UOS_QR_HTTP` | 是否启动 QR HTTP 服务 | `true` |
+| `WECHAT_UOS_QR_PORT` | QR HTTP 端口 | `8646` |
+| `WECHAT_UOS_HOME_CHANNEL` | 默认通知群组 | 空 |
 
-| 命令 | 说明 |
-|------|------|
-| `开启上传` / `关闭上传` | 图床上传开关（管理员） |
-| `上传` | 上传最新收到的媒体文件到图床 |
+### 群聊命令
 
-### LSPosed 模块更新
+发送 `@机器人` + 命令：
 
-| 命令 | 说明 |
-|------|------|
-| `开启更新` / `关闭更新` | 模块更新推送开关（管理员） |
+#### 授权管理
+- `开启授权` — 授权本群，首次发送者自动成为管理员
+- `关闭授权` — 关闭本群授权（仅管理员）
+- `授权 昵称` — 授权成员使用盘搜（仅管理员）
+- `取消授权 昵称` — 取消成员权限（仅管理员）
+- `权限列表` — 查看本群权限
+- `刷新成员` — 刷新群成员缓存
 
-### 其他
+#### 盘搜
+- `搜索 <关键词>` — 搜索网盘资源
+- `开启盘搜` / `关闭盘搜` — 盘搜开关（仅管理员）
 
-- `@机器人 <任意消息>` — 直接与 Hermes AI 对话
-- `帮助` — 显示帮助菜单
+#### TG 转发
+- `开启转发` / `关闭转发` — TG 转发开关（仅管理员）
 
-## 数据文件
+#### CFTC 上传
+- `上传` — 上传最新媒体到图床
+- `开启上传` / `关闭上传` — 图床上传开关（仅管理员）
 
-```
-~/.hermes/wechat_uos/
-├── acl.json              # 群授权数据（含 allowed_mps）
-├── itchat.pkl            # itchat 热重载状态
-└── itchat_qr.png         # 登录 QR 码
+#### 抖音解析
+- `开启抖音解析` / `关闭抖音解析` — 抖音视频自动解析开关（仅管理员）
 
-~/.hermes/data/
-├── cftc/                 # CFTC 图床缓存
-├── tg_fwd/
-│   ├── config.json       # TG 转发配置
-│   └── state_*.json      # 各频道已转发消息 ID
-└── lsposed_tracker/
-    ├── config.json       # LSPosed 配置
-    └── seen.json         # 已推送的 release IDs
-```
+#### 公众号订阅
+- `订阅 <公众号名>` — 为本群订阅公众号推送
+- `取消订阅 <公众号名>` — 取消订阅
+- `订阅列表` — 查看本群已订阅的公众号
 
-## 注意事项
+#### LSPosed 模块更新
+- `开启更新` / `关闭更新` — 模块更新推送开关（仅管理员）
+- `模块更新状态` — 查看当前跟踪状态
 
-- itchat-uos 是逆向协议，建议使用备用微信号
-- 群 ID (`@@...`) 随重连可能变化，系统自动迁移并保留所有功能配置
-- Telegram Bot token 不能分享，TG 转发使用 gateway 的 channel_post 回调（无需单独轮询）
-- 微信公众号推送依赖 WeRSS 服务（Docker），需在 WeRSS 单独扫码登录 mp.weixin.qq.com
+#### 其他
+- `帮助` — 显示完整帮助菜单
+
+### 数据文件
+
+保存在 `~/.hermes/wechat_uos/` 目录下：
+
+| 文件 | 说明 |
+|---|---|
+| `acl.json` | 群授权记录（含成员缓存） |
+| `itchat.pkl` | 微信热登录状态 |
+| `itchat_qr.png` | 最新登录二维码 |
+| `tg_fwd/config.json` | TG 转发配置 |
+| `lsposed/config.json` | LSPosed 模块追踪配置 |
+| `cftc_media/` | CFTC 上传缓存 |
+| `werss_state.json` | 公众号已推送文章 ID 记录 |
+
+### 变更日志
+
+#### 2026-06-26
+- **抖音解析：** 改用 `send_video` 发送视频（微信内直接播放），去除 FFmpeg 重编码
+- **抖音解析：** API 失败时自动降级为页面抓取，不再直接报错
+- **抖音解析：** 默认关闭，仅已授权群可用
+- **ACL 持久化：** 清理函数不再删除已授权群，重启后保留授权和功能配置
+- **ACL 持久化：** GID 迁移后自动删除旧条目，防止累积膨胀
+- **ACL 持久化：** `douyin_enabled` 添加默认值，新群默认关闭
