@@ -16,6 +16,8 @@ import logging
 import os
 import re
 import threading
+import subprocess
+import sys
 import time
 import urllib.request
 from datetime import datetime
@@ -329,6 +331,53 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._cleanup_stale_gids()
         except Exception:
             logger.exception("WeChatUOS: stale GID cleanup failed")
+        try:
+            self._run_health_check()
+        except Exception:
+            logger.exception("WeChatUOS: health check failed")
+
+    def _run_health_check(self) -> None:
+        """运行健康检查脚本并发送报告到夢魚个人微信。"""
+        script = HERMES_HOME / "scripts" / "wechat_health_check.py"
+        if not script.exists():
+            logger.warning("WeChatUOS: health check script not found at %s", script)
+            return
+        try:
+            r = subprocess.run(
+                [sys.executable, str(script)],
+                capture_output=True, text=True, timeout=30
+            )
+            report = r.stdout.strip()
+            if not report:
+                report = "健康检查无输出"
+            else:
+                lines = report.split("\n")
+                content_lines = []
+                capture = False
+                for line in lines:
+                    if line.startswith("===="):
+                        capture = True
+                        continue
+                    if capture and line.strip():
+                        content_lines.append(line)
+                report = "\n".join(content_lines) if content_lines else report
+
+            admin_uid = self._acl.get("_super_admin_uid", "")
+            if admin_uid and self._itchat:
+                max_len = 3500
+                if len(report) > max_len:
+                    summary_parts = []
+                    for line in report.split("\n"):
+                        summary_parts.append(line)
+                        if any(kw in line for kw in ["功能概览", "整体健康"]):
+                            break
+                    report = "\n".join(summary_parts)
+                self._itchat.send(f"🩺 登录后健康检查报告\n\n{report}", toUserName=admin_uid)
+                logger.info("WeChatUOS: health check report sent to super admin")
+            else:
+                logger.warning("WeChatUOS: cannot send health check - no admin UID or itchat")
+        except Exception:
+            logger.exception("WeChatUOS: health check execution failed")
 
     def _migrate_home_channel_gid(self) -> None:
         """Find the current '机器人测试' group GID and update home channel."""
@@ -1751,10 +1800,10 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         if not text:
             return None
         patterns = [
-            r'https?://weixin\\.qq\\.com/sph/\\S+',
-            r'//weixin\\.qq\\.com/sph/\\S+',
-            r'https?://channels\\.weixin\\.qq\\.com/\\S+',
-            r'//channels\\.weixin\\.qq\\.com/\\S+',
+            r'https?://weixin\.qq\.com/sph/\S+',
+            r'//weixin\.qq\.com/sph/\S+',
+            r'https?://channels\.weixin\.qq\.com/\S+',
+            r'//channels\.weixin\.qq\.com/\S+',
         ]
         for pat in patterns:
             m = re.search(pat, text)
