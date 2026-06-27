@@ -85,6 +85,8 @@ LSPOSED_CONFIG = LSPOSED_DIR / "config.json"
 LSPOSED_STATE_FILE = LSPOSED_DIR / "state.json"
 # ── 抖音解析 API ─────────────────────────────────────────────────────────
 DOUYIN_API_BASE = "http://192.168.10.216:8002"
+# ── 视频号解析 API ──
+SPH_API_BASE = "https://sphapi.half.nyc.mn"
 # ── WeRSS 公众号文章推送 ──
 WERSS_BASE = "http://localhost:8001/api/v1/wx"
 WERSS_USER = "admin"
@@ -122,10 +124,20 @@ def _strip_at_prefix(text: str) -> str:
     """Remove common WeChat @ prefix noise while preserving the user's prompt."""
     if not text:
         return ""
-    # WeChat group @ text often starts with "@Nick\u2005" or "@Nick "
-    s = text.replace("\u2005", " ").strip()
+    s = text.strip()
     if s.startswith("@"):
-        parts = s.split(maxsplit=1)
+        # Check for u2005 (narrow no-break space — WeChat puts this after full nickname)
+        idx = s.find("\u2005")
+        if idx >= 0:
+            return s[idx + 1:].strip()
+        # Try zero-width spaces
+        for zw in ("\u200b", "\u200c", "\u200d", "\ufeff", "\u2060"):
+            idx = s.find(zw)
+            if idx >= 0:
+                return s[idx + 1:].strip()
+        # Fallback: strip @ prefix by splitting on first space
+        rest = s[1:].lstrip()
+        parts = rest.split(maxsplit=1)
         if len(parts) == 2:
             return parts[1].strip()
     return s
@@ -432,6 +444,12 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 # ── 抖音链接解析 ──
                 if self._handle_douyin_parse(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
+                # ── 视频号解析 toggle ──
+                if self._handle_sph_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
+                # ── 视频号链接解析 ──
+                if self._handle_sph_parse(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
+                    return
                 # ── CFTC toggle/upload commands ──
                 if self._handle_cftc_toggle_command(text, group_id=group_id, group_name=group_name, sender=sender, sender_id=sender_id):
                     return
@@ -593,7 +611,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                     "restored_from_group_id": restored_from_group_id,
                 }
                 # Carry over feature-specific settings from the old record
-                for _key in ("allowed_mps", "allowed_mps_since", "werss_enabled", "douyin_enabled",
+                for _key in ("allowed_mps", "allowed_mps_since", "werss_enabled", "douyin_enabled", "sph_enabled",
                              "pansou_enabled", "cftc_enabled", "tg_fwd_enabled",
                              "tg_forward_enabled", "allow_reply", "auto_reply"):
                     _val = restored.get(_key)
@@ -640,6 +658,7 @@ class WeChatUOSAdapter(BasePlatformAdapter):
         group.setdefault("lsposed_enabled", False)
         group.setdefault("werss_enabled", True)
         group.setdefault("douyin_enabled", False)
+        group.setdefault("sph_enabled", False)
         if group.get("restored_from_group_id") and group.get("updated_at") == now:
             self._save_acl()
         return group
@@ -1724,6 +1743,169 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             self._itchat.send(f"🎬 抖音视频\n🔗 {url}", toUserName=group_id)
         return True
 
+    # ── 视频号解析 ────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _extract_sph_url(text: str) -> Optional[str]:
+        """Extract a WeChat 视频号 share URL from text, or return None."""
+        if not text:
+            return None
+        patterns = [
+            r'https?://weixin\\.qq\\.com/sph/\\S+',
+            r'//weixin\\.qq\\.com/sph/\\S+',
+            r'https?://channels\\.weixin\\.qq\\.com/\\S+',
+            r'//channels\\.weixin\\.qq\\.com/\\S+',
+        ]
+        for pat in patterns:
+            m = re.search(pat, text)
+            if m:
+                return m.group(0).rstrip('/')
+        return None
+
+    def _sph_is_enabled(self, group_id: str) -> bool:
+        """Check if 视频号 parsing is enabled for this group."""
+        with self._acl_lock:
+            return self._group_acl(group_id, "").get("sph_enabled", False)
+
+    def _handle_sph_toggle_command(self, text: str, *, group_id: str, group_name: str, sender: str, sender_id: str) -> bool:
+        """Handle 开启视频号解析 / 关闭视频号解析 commands. Returns True if consumed."""
+        s = (text or "").strip().lower()
+        compact = s.replace(" ", "")
+        if compact in ("开启视频号解析", "关闭视频号解析"):
+            cmd = compact
+        else:
+            parts = s.split()
+            if len(parts) >= 2 and parts[1] in ("开启视频号解析", "关闭视频号解析"):
+                cmd = parts[1]
+            else:
+                return False
+        if self._itchat is None:
+            return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            if not group.get("authorized"):
+                self._itchat.send("本群尚未开启 Hermes，请先发送：开启授权", toUserName=group_id)
+                return True
+            if not self._is_group_admin(group, sender, sender_id):
+                self._itchat.send("你没有权限管理视频号解析。", toUserName=group_id)
+                return True
+            enable = "开启" in cmd
+            group["sph_enabled"] = enable
+            self._save_acl()
+        status = "✅ 已开启" if enable else "❌ 已关闭"
+        self._itchat.send(f"{status}视频号链接自动解析", toUserName=group_id)
+        logger.info("WeChatUOS SPH: parse %s for %s", "enabled" if enable else "disabled", group_name)
+        return True
+
+    def _handle_sph_parse(self, text: str, *, group_id: str, group_name: str, sender: str = "", sender_id: str = "") -> bool:
+        """Parse a 视频号 video share link. Returns True if consumed."""
+        url = self._extract_sph_url(text)
+        if url is None:
+            return False
+        if self._itchat is None:
+            return True
+        with self._acl_lock:
+            group = self._group_acl(group_id, group_name)
+            if not group.get("authorized"):
+                return False
+        if not self._sph_is_enabled(group_id):
+            return False
+        logger.info("WeChatUOS SPH: parsing %s in %s", url, group_name)
+
+        # ── Call API ──
+        try:
+            api_url = f"{SPH_API_BASE}/api/fetch_video_profile"
+            req = _URLRequest(api_url, data=json.dumps({"url": url}).encode("utf-8"),
+                              headers={"Content-Type": "application/json",
+                                       "User-Agent": "Hermes-WeChatUOS/1.0"},
+                              method="POST")
+            with _urlopen(req, timeout=30) as resp:
+                body = json.loads(resp.read().decode("utf-8"), strict=False)
+        except Exception as e:
+            logger.warning("WeChatUOS SPH: API error: %s", e)
+            self._itchat.send(f"❌ 视频号解析失败: {e}\n🔗 {url}", toUserName=group_id)
+            return True
+
+        return self._sph_handle_api_data(body, url, group_id, group_name)
+
+    def _sph_handle_api_data(self, data: dict, url: str, group_id: str, group_name: str) -> bool:
+        """Handle API response for 视频号. Download & send video."""
+        feed_info = (data or {}).get("data", {}).get("feedInfo", {})
+        author_info = (data or {}).get("data", {}).get("authorInfo", {})
+
+        if not feed_info:
+            err = (data or {}).get("error", "未知错误")
+            self._itchat.send(f"❌ 视频号解析失败: {err}\n🔗 {url}", toUserName=group_id)
+            return True
+
+        title = feed_info.get("description", "视频号视频")
+        author = author_info.get("nickname", "") if isinstance(author_info, dict) else ""
+        cover_url = feed_info.get("coverUrl", "")
+
+        # Get best video URL
+        video_url = ""
+        h264 = feed_info.get("h264VideoInfo", {})
+        if isinstance(h264, dict):
+            video_url = h264.get("videoUrl", "")
+        if not video_url:
+            h265 = feed_info.get("h265VideoInfo", {})
+            if isinstance(h265, dict):
+                video_url = h265.get("videoUrl", "")
+        if not video_url:
+            video_url = feed_info.get("videoUrl", "")
+
+        # Stats
+        likes = feed_info.get("likeCountFmt", "")
+        favs = feed_info.get("favCountFmt", "")
+        forwards = feed_info.get("forwardCountFmt", "")
+        comments = feed_info.get("commentCountFmt", "")
+
+        if not video_url:
+            # No video URL - send metadata only
+            lines = [f"📹 {title[:50]}"]
+            if author:
+                lines.append(f"👤 {author}")
+            if likes or favs:
+                parts = [f"👍 {likes}"] if likes else []
+                parts.append(f"❤️ {favs}") if favs else None
+                if parts:
+                    lines.append("  ".join(parts))
+            lines.append(f"🔗 {url}")
+            lines.append("⚠️ 未找到视频下载链接")
+            self._itchat.send("\n".join(lines), toUserName=group_id)
+            return True
+
+        # Download and send video
+        try:
+            self._itchat.send(f"⏳ 下载中… {title[:30]}", toUserName=group_id)
+            dl_req = _URLRequest(video_url, headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": "https://weixin.qq.com/"
+            })
+            with _urlopen(dl_req, timeout=120) as dl_resp:
+                data_bytes = dl_resp.read()
+            tmp_path = f"/tmp/sph_{int(time.time())}.mp4"
+            with open(tmp_path, "wb") as f:
+                f.write(data_bytes)
+            import os as _os
+            self._itchat.send_video(tmp_path, toUserName=group_id)
+            _os.unlink(tmp_path)
+            logger.info("WeChatUOS SPH: sent video '%s' (%d KB)", title[:20], len(data_bytes) // 1024)
+        except Exception as e:
+            logger.exception("WeChatUOS SPH: download/send error for %s", url)
+            lines = [f"📹 {title[:50]}"]
+            if author:
+                lines.append(f"👤 {author}")
+            if likes or favs:
+                parts = [f"👍 {likes}"] if likes else []
+                parts.append(f"❤️ {favs}") if favs else None
+                if parts:
+                    lines.append("  ".join(parts))
+            lines.append(f"🔗 {video_url}")
+            lines.append("⚠️ 视频直链可能被防刷，复制到浏览器打开")
+            self._itchat.send("\n".join(lines), toUserName=group_id)
+        return True
+
     # ── 帮助 ────────────────────────────────────────────────────────────────
 
     def _handle_help_command(self, text: str, *, group_id: str, group_name: str, sender: str = "", sender_id: str = "") -> bool:
@@ -1751,6 +1933,9 @@ class WeChatUOSAdapter(BasePlatformAdapter):
             "🎵 抖音解析\n"
             "  直接发送抖音/TikTok链接自动解析\n"
             "  开启抖音解析 / 关闭抖音解析\n\n"
+            "📹 视频号解析\n"
+            "  直接发送视频号链接自动解析\n"
+            "  开启视频号解析 / 关闭视频号解析\n\n"
             "📰 公众号推送\n"
             "  订阅 公众号名 / 取消订阅 公众号名\n"
             "  订阅列表 / 查看订阅\n"

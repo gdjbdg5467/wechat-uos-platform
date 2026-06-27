@@ -1,0 +1,46 @@
+# WxWeChatBot 配置文件示例
+# 复制此文件为 config.yaml 并修改配置
+
+wechat:
+  hotReload: true
+  qr_port: 8080
+  qr_http: true
+
+admin:
+  super_admin_names:
+    - "夢魚"
+    - "庾梦"
+
+pansou:
+  api_url: "http://192.168.10.216:850/api/search"
+  allowed_types:
+    - "video"
+    - "image"
+    - "article"
+
+tg_fwd:
+  bot_token: ""
+  forward_rules: []
+
+cftc:
+  api_url: ""
+  credentials:
+    api_key: ""
+    secret: ""
+
+lsposed:
+  enabled: false
+  interval_seconds: 300
+  target_groups: []
+  custom_repos: []
+  web_sources: []
+
+douyin:
+  api_base: "https://api.douyin.com"
+
+werss:
+  base_url: ""
+  username: ""
+  password: ""
+
+data_dir: "./state"
