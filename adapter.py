@@ -362,7 +362,15 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                         content_lines.append(line)
                 report = "\n".join(content_lines) if content_lines else report
 
-            admin_uid = self._acl.get("_super_admin_uid", "")
+            admin_uid = ""
+            # Try dynamic resolution from pickle first (UOS reconnect changes UIDs)
+            try:
+                admin_uid = self._find_admin_uid_from_pickle()
+            except Exception:
+                logger.exception("WeChatUOS: dynamic admin UID resolution failed")
+            # Fallback to cached UID in ACL if pickle resolution fails
+            if not admin_uid:
+                admin_uid = self._acl.get("_super_admin_uid", "")
             if admin_uid and self._itchat:
                 max_len = 3500
                 if len(report) > max_len:
@@ -378,6 +386,48 @@ class WeChatUOSAdapter(BasePlatformAdapter):
                 logger.warning("WeChatUOS: cannot send health check - no admin UID or itchat")
         except Exception:
             logger.exception("WeChatUOS: health check execution failed")
+
+    def _find_admin_uid_from_pickle(self) -> str:
+        """从 itchat.pkl 实时查找夢魚/庾梦的当前 UserName。
+        UOS 重连后 UserName 会变，不能依赖 acl.json 缓存的 _super_admin_uid。"""
+        import pickle
+        pkl = PKL_FILE
+        if not pkl.exists():
+            return ""
+        try:
+            with open(pkl, "rb") as f:
+                data = pickle.load(f)
+        except Exception:
+            return ""
+        # Search through all chatroom member lists
+        seen = set()
+        for key in ("chatroomList", "chatroom_list", "chatrooms"):
+            rooms = data.get(key, []) if isinstance(data, dict) else []
+            if not isinstance(rooms, list):
+                continue
+            for room in rooms:
+                members = None
+                if isinstance(room, dict):
+                    members = room.get("MemberList") or room.get("member_list") or room.get("memberList")
+                if not isinstance(members, list):
+                    continue
+                for m in members:
+                    if not isinstance(m, dict):
+                        continue
+                    uid = m.get("UserName", "") or m.get("Uin", "")
+                    if not uid or uid in seen:
+                        continue
+                    seen.add(uid)
+                    for name_key in ("NickName", "DisplayName", "RemarkName", "nick_name", "display_name"):
+                        nick = m.get(name_key, "")
+                        if nick and nick in ("夢魚", "庾梦"):
+                            logger.info("WeChatUOS: found admin %s with UID %s from pickle", nick, uid)
+                            # Update ACL cache for future use
+                            self._acl["_super_admin_uid"] = uid
+                            self._save_acl()
+                            return uid
+        logger.warning("WeChatUOS: admin not found in itchat.pkl")
+        return ""
 
     def _migrate_home_channel_gid(self) -> None:
         """Find the current '机器人测试' group GID and update home channel."""
